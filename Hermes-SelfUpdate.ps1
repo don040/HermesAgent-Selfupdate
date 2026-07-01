@@ -599,9 +599,8 @@ function Send-DiscordWebhookReport {
         throw "Report attachment missing: $AttachmentPath"
     }
 
-    $payloadObject = @{
-        username = 'Hermes Update'
-    }
+    # Omit username so Discord uses the webhook's configured default identity.
+    $payloadObject = @{}
 
     if ($null -ne $Embed) {
         $payloadObject.embeds = @($Embed)
@@ -674,9 +673,7 @@ function Send-DiscordWebhookReport {
         }
     }
 
-    $fallbackBody = @{
-        username = 'Hermes Update'
-    }
+    $fallbackBody = @{}
 
     if ($null -ne $Embed) {
         $fallbackBody.embeds = @($Embed)

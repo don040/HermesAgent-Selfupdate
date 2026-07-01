@@ -36,7 +36,7 @@ if ([string]::IsNullOrWhiteSpace($WebhookUrl)) {
 
 $HermesHome = 'C:\Users\Administrator\AppData\Local\hermes'
 $HermesRepo = Join-Path $HermesHome 'hermes-agent'
-$HermesExe  = Join-Path $HermesRepo 'venv\Scripts\hermes.exe'
+$HermesExe = Join-Path $HermesRepo 'venv\Scripts\hermes.exe'
 $HermesPython = Join-Path $HermesRepo 'venv\Scripts\python.exe'
 $HermesModule = 'hermes_cli.main'
 $HermesUserProfile = 'C:\Users\Administrator'
@@ -101,7 +101,7 @@ $GatewayStartOut = Join-Path $LogDir 'weekly-self-update.gateway-start.out.log'
 $GatewayStartErr = Join-Path $LogDir 'weekly-self-update.gateway-start.err.log'
 
 $GatewayStatusBeforeFile = Join-Path $LogDir 'weekly-self-update.gateway-status-before.log'
-$GatewayStatusAfterFile  = Join-Path $LogDir 'weekly-self-update.gateway-status-after.log'
+$GatewayStatusAfterFile = Join-Path $LogDir 'weekly-self-update.gateway-status-after.log'
 
 $UpdateTimeoutMinutes = 20
 $GatewayStartWaitSeconds = 15
@@ -132,7 +132,7 @@ function Get-DirectorySizeBytes {
         -Recurse `
         -Force `
         -ErrorAction SilentlyContinue |
-        Measure-Object -Property Length -Sum
+    Measure-Object -Property Length -Sum
 
     if ($null -eq $measurement.Sum) {
         return [long]0
@@ -204,10 +204,10 @@ function ConvertTo-HermesVersionInfo {
     }
 
     return [pscustomobject]@{
-        Version = $version
-        Release = $release
+        Version  = $version
+        Release  = $release
         Revision = $revision
-        Raw = $VersionText
+        Raw      = $VersionText
     }
 }
 
@@ -364,8 +364,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$ScriptPath" -ScheduleO
 
     if ($badParents.Count -gt 0) {
         $details = ($badParents | ForEach-Object {
-            "PID=$($_.ProcessId) Name=$($_.Name) Path=$($_.ExecutablePath)"
-        }) -join "`r`n"
+                "PID=$($_.ProcessId) Name=$($_.Name) Path=$($_.ExecutablePath)"
+            }) -join "`r`n"
 
         throw @"
 Refusing to run because this process appears to be launched from inside Hermes.
@@ -624,8 +624,8 @@ function Send-DiscordWebhookReport {
         # Windows PowerShell 5.1. Let curl read UTF-8 JSON from a temporary
         # file so Discord receives valid multipart payload_json data.
         $payloadFile = Join-Path `
-            ([IO.Path]::GetTempPath()) `
-            ("hermes-webhook-" + [guid]::NewGuid().ToString('N') + '.json')
+        ([IO.Path]::GetTempPath()) `
+        ("hermes-webhook-" + [guid]::NewGuid().ToString('N') + '.json')
 
         try {
             [IO.File]::WriteAllText(
@@ -654,8 +654,8 @@ function Send-DiscordWebhookReport {
             $exitCode = $LASTEXITCODE
 
             $responseText = (($response | ForEach-Object {
-                $_.ToString()
-            }) -join "`r`n").TrimEnd()
+                        $_.ToString()
+                    }) -join "`r`n").TrimEnd()
 
             if ($responseText) {
                 Write-Log "Webhook response: $responseText"
@@ -734,17 +734,17 @@ function Repair-HermesInstallation {
     $reasonText = ($Reasons | Where-Object { $_ }) -join "`n"
 
     $startEmbed = @{
-        title = "$yellow Hermes Repair Started"
+        title       = "$yellow Hermes Repair Started"
         description = 'A clean Hermes installation will be built in an isolated temporary directory.'
-        color = 16705372
-        timestamp = $started.ToUniversalTime().ToString('o')
-        fields = @(
+        color       = 16705372
+        timestamp   = $started.ToUniversalTime().ToString('o')
+        fields      = @(
             @{ name = 'Detected Issue'; value = $reasonText; inline = $false },
             @{ name = 'Official Source'; value = 'NousResearch/hermes-agent Windows installer (main branch)'; inline = $false },
             @{ name = 'Safety Policy'; value = 'Existing installation files are never overwritten. Only missing source files are added. User data and configuration are outside the repair copy scope.'; inline = $false },
             @{ name = 'Launcher Handling'; value = 'The launcher is regenerated for the existing target venv; a launcher from the temporary venv is never copied.'; inline = $false }
         )
-        footer = @{ text = "$env:COMPUTERNAME | Hermes Repair Observer" }
+        footer      = @{ text = "$env:COMPUTERNAME | Hermes Repair Observer" }
     }
 
     try {
@@ -979,15 +979,16 @@ function Repair-HermesInstallation {
     $launcher = if (Test-Path -LiteralPath $HermesExe) { 'PRESENT' } else { 'MISSING' }
 
     $resultEmbed = @{
-        title = "$symbol Hermes Repair $word"
+        title       = "$symbol Hermes Repair $word"
         description = if ($success) {
             'The isolated repair completed successfully. The normal update will now continue.'
-        } else {
+        }
+        else {
             'The isolated repair failed. The update has been stopped to protect the installation.'
         }
-        color = if ($success) { 5763719 } else { 15548997 }
-        timestamp = $finished.ToUniversalTime().ToString('o')
-        fields = @(
+        color       = if ($success) { 5763719 } else { 15548997 }
+        timestamp   = $finished.ToUniversalTime().ToString('o')
+        fields      = @(
             @{ name = 'Result'; value = $result; inline = $true },
             @{ name = 'Duration'; value = $duration; inline = $true },
             @{ name = 'Launcher'; value = $launcher; inline = $true },
@@ -999,7 +1000,7 @@ function Repair-HermesInstallation {
             @{ name = 'Hermes Version'; value = $version; inline = $false },
             @{ name = 'Errors'; value = $errorText; inline = $false }
         )
-        footer = @{ text = "$env:COMPUTERNAME | Hermes Repair Observer" }
+        footer      = @{ text = "$env:COMPUTERNAME | Hermes Repair Observer" }
     }
 
     try {
@@ -1024,11 +1025,11 @@ function Repair-HermesInstallation {
     Save-Report
 
     return [pscustomobject]@{
-        Success = $success
-        RestoredFiles = $added.ToArray()
+        Success        = $success
+        RestoredFiles  = $added.ToArray()
         LauncherStatus = $launcher
-        Version = $version
-        Errors = $errors.ToArray()
+        Version        = $version
+        Errors         = $errors.ToArray()
     }
 }
 # ============================================================
@@ -1173,78 +1174,78 @@ if ($effectiveScriptArguments.Count -eq 0) {
 
 $runIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $startEmbed = @{
-    title = "$EmojiBlueCircle Hermes Self-Update Started"
+    title       = "$EmojiBlueCircle Hermes Self-Update Started"
     description = "Hermes update execution has started on **$env:COMPUTERNAME**."
-    color = 3447003
-    timestamp = $RunStartedAt.ToUniversalTime().ToString('o')
-    fields = @(
+    color       = 3447003
+    timestamp   = $RunStartedAt.ToUniversalTime().ToString('o')
+    fields      = @(
         @{
-            name = 'Server ID'
-            value = $env:COMPUTERNAME
+            name   = 'Server ID'
+            value  = $env:COMPUTERNAME
             inline = $true
         },
         @{
-            name = 'Timestamp'
-            value = $RunStartedAt.ToString('yyyy-MM-ddTHH:mm:ssK')
+            name   = 'Timestamp'
+            value  = $RunStartedAt.ToString('yyyy-MM-ddTHH:mm:ssK')
             inline = $true
         },
         @{
-            name = $GatewayServiceName
-            value = "$gatewayServiceStatusBefore`nPID: $gatewayServicePidBeforeText"
+            name   = $GatewayServiceName
+            value  = "$gatewayServiceStatusBefore`nPID: $gatewayServicePidBeforeText"
             inline = $true
         },
         @{
-            name = 'Mode'
-            value = $runMode
+            name   = 'Mode'
+            value  = $runMode
             inline = $true
         },
         @{
-            name = 'User'
-            value = $runIdentity
+            name   = 'User'
+            value  = $runIdentity
             inline = $true
         },
         @{
-            name = 'Installation Size'
-            value = (Format-ByteSize -Bytes $InstallSizeBeforeBytes)
+            name   = 'Installation Size'
+            value  = (Format-ByteSize -Bytes $InstallSizeBeforeBytes)
             inline = $true
         },
         @{
-            name = 'Hermes Version'
-            value = $HermesVersionBeforeInfo.Version
+            name   = 'Hermes Version'
+            value  = $HermesVersionBeforeInfo.Version
             inline = $true
         },
         @{
-            name = 'Release'
-            value = $HermesVersionBeforeInfo.Release
+            name   = 'Release'
+            value  = $HermesVersionBeforeInfo.Release
             inline = $true
         },
         @{
-            name = 'Revision'
-            value = $HermesVersionBeforeInfo.Revision
+            name   = 'Revision'
+            value  = $HermesVersionBeforeInfo.Revision
             inline = $true
         },
         @{
-            name = 'Preflight Repair'
-            value = $repairStatusText
+            name   = 'Preflight Repair'
+            value  = $repairStatusText
             inline = $false
         },
         @{
-            name = 'Command'
-            value = '```powershell' + "`nhermes update --yes --backup --force`n" + '```'
+            name   = 'Command'
+            value  = '```powershell' + "`nhermes update --yes --backup --force`n" + '```'
             inline = $false
         },
         @{
-            name = 'Execution Details'
-            value = "**Arguments:** $($effectiveScriptArguments -join ' ')`n**Task:** $ScheduledTaskName`n**Script:** $ScriptPath"
+            name   = 'Execution Details'
+            value  = "**Arguments:** $($effectiveScriptArguments -join ' ')`n**Task:** $ScheduledTaskName`n**Script:** $ScriptPath"
             inline = $false
         },
         @{
-            name = 'Environment'
-            value = "**HERMES_HOME:** $env:HERMES_HOME`n**Git:** $GitExe"
+            name   = 'Environment'
+            value  = "**HERMES_HOME:** $env:HERMES_HOME`n**Git:** $GitExe"
             inline = $false
         }
     )
-    footer = @{
+    footer      = @{
         text = "Hermes Update Observer | Started by $runIdentity"
     }
 }
@@ -1766,103 +1767,103 @@ else {
 }
 
 $finalEmbed = @{
-    title = "$statusCircle Hermes Self-Update $overallStatus"
+    title       = "$statusCircle Hermes Self-Update $overallStatus"
     description = $finalDescription
-    color = $finalColor
-    timestamp = $RunFinishedAt.ToUniversalTime().ToString('o')
-    fields = @(
+    color       = $finalColor
+    timestamp   = $RunFinishedAt.ToUniversalTime().ToString('o')
+    fields      = @(
         @{
-            name = 'Server ID'
-            value = $env:COMPUTERNAME
+            name   = 'Server ID'
+            value  = $env:COMPUTERNAME
             inline = $true
         },
         @{
-            name = 'Result'
-            value = "$overallEmoji $overallStatus"
+            name   = 'Result'
+            value  = "$overallEmoji $overallStatus"
             inline = $true
         },
         @{
-            name = 'Duration'
-            value = "$(Format-Duration -Duration $RunDuration)"
+            name   = 'Duration'
+            value  = "$(Format-Duration -Duration $RunDuration)"
             inline = $true
         },
         @{
-            name = 'Started'
-            value = $RunStartedAt.ToString('yyyy-MM-ddTHH:mm:ssK')
+            name   = 'Started'
+            value  = $RunStartedAt.ToString('yyyy-MM-ddTHH:mm:ssK')
             inline = $true
         },
         @{
-            name = 'Finished'
-            value = $RunFinishedAt.ToString('yyyy-MM-ddTHH:mm:ssK')
+            name   = 'Finished'
+            value  = $RunFinishedAt.ToString('yyyy-MM-ddTHH:mm:ssK')
             inline = $true
         },
         @{
-            name = $GatewayServiceName
-            value = "$gatewayEmoji $gatewayServiceStatus`nPID: $gatewayServicePidAfterText"
+            name   = $GatewayServiceName
+            value  = "$gatewayEmoji $gatewayServiceStatus`nPID: $gatewayServicePidAfterText"
             inline = $true
         },
         @{
-            name = 'Version Before'
-            value = $HermesVersionBeforeInfo.Version
+            name   = 'Version Before'
+            value  = $HermesVersionBeforeInfo.Version
             inline = $true
         },
         @{
-            name = 'Version After'
-            value = $HermesVersionAfterInfo.Version
+            name   = 'Version After'
+            value  = $HermesVersionAfterInfo.Version
             inline = $true
         },
         @{
-            name = 'Revision'
-            value = $revisionDisplay
+            name   = 'Revision'
+            value  = $revisionDisplay
             inline = $true
         },
         @{
-            name = 'Changes'
-            value = $commitSummary
+            name   = 'Changes'
+            value  = $commitSummary
             inline = $true
         },
         @{
-            name = 'Backup'
-            value = $backupSize
+            name   = 'Backup'
+            value  = $backupSize
             inline = $true
         },
         @{
-            name = 'Size Change'
-            value = (Format-ByteDelta -Bytes $InstallSizeDeltaBytes)
+            name   = 'Size Change'
+            value  = (Format-ByteDelta -Bytes $InstallSizeDeltaBytes)
             inline = $true
         },
         @{
-            name = 'Installation Size'
-            value = "**Before:** $(Format-ByteSize -Bytes $InstallSizeBeforeBytes) | **After:** $(Format-ByteSize -Bytes $InstallSizeAfterBytes)"
+            name   = 'Installation Size'
+            value  = "**Before:** $(Format-ByteSize -Bytes $InstallSizeBeforeBytes) | **After:** $(Format-ByteSize -Bytes $InstallSizeAfterBytes)"
             inline = $false
         },
         @{
-            name = 'Update Exit'
-            value = "$updateExitCode"
+            name   = 'Update Exit'
+            value  = "$updateExitCode"
             inline = $true
         },
         @{
-            name = 'Restart Exit'
-            value = "$restartExitCode"
+            name   = 'Restart Exit'
+            value  = "$restartExitCode"
             inline = $true
         },
         @{
-            name = 'Gateway Check'
-            value = "$gatewayStatusCheckExit"
+            name   = 'Gateway Check'
+            value  = "$gatewayStatusCheckExit"
             inline = $true
         },
         @{
-            name = 'Restart Mode'
-            value = $restartMode
+            name   = 'Restart Mode'
+            value  = $restartMode
             inline = $false
         },
         @{
-            name = 'Preflight Repair'
-            value = $repairStatusText
+            name   = 'Preflight Repair'
+            value  = $repairStatusText
             inline = $false
         }
     )
-    footer = @{
+    footer      = @{
         text = 'Hermes Update Observer | Detailed report follows below'
     }
 }

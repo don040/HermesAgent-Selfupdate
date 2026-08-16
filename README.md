@@ -1,73 +1,79 @@
-# Hermes Self-Update for Windows
+# Hermes Agent Self-Update for Windows
 
-A safety-focused PowerShell script for updating a Hermes Agent installation on Windows without leaving locked files, orphaned processes, or an unavailable gateway service behind.
+This repository installs a fleet-ready Windows workflow that refreshes its own
+code before safely updating Hermes Agent.
 
-The script performs the update outside the active Hermes process tree by creating a one-time Windows Scheduled Task running as `SYSTEM`. It stops the Hermes gateway, terminates remaining Hermes-owned processes, creates a backup, installs the update, verifies the result, restores the previous gateway state, and generates a detailed report.
+The persistent Scheduled Task runs every day at **04:00 local VM time** as
+`LOCAL SYSTEM`. A stable supervisor updates the managed checkout at `C:\scripts`,
+validates the exact `origin/main` commit, exports a protected commit-exact run
+snapshot, and only then starts the Hermes update core in a new PowerShell process.
 
-Optional Discord webhook notifications provide live status information and a complete post-update report.
+## Quick start
 
-## Features
+From an elevated Windows PowerShell 5.1 session, use the same bootstrap for a
+fresh machine or a legacy single-file installation. The installer locates
+system Git or Hermes Portable Git itself:
 
-- Safe Hermes self-update on Windows
-- One-time execution through Windows Task Scheduler
-- Runs the destructive update phase as `SYSTEM`
-- Prevents destructive execution from inside Hermes
-- Detects Hermes-related parent processes before updating
-- Configures the correct Administrator profile for scheduled execution
-- Stops the Hermes gateway cleanly through the Hermes CLI
-- Stops detected Hermes gateway services
-- Terminates remaining Hermes, Python, Node.js, or Bun processes belonging to the Hermes installation
-- Creates a backup using the built-in Hermes update command
-- Automatically repairs missing or incomplete Hermes installations when possible
-- Supports Portable Git and `uv` installations
-- Applies configurable execution timeouts
-- Restarts the gateway only if it was running before the update
-- Supports both Windows service and manual gateway restart modes
-- Verifies the Hermes launcher after the update
-- Compares versions and revisions before and after the update
-- Measures installation size changes
-- Produces separate stdout and stderr logs
-- Generates a detailed human-readable update report
-- Sends structured Discord status embeds
-- Uploads the full report as a Discord attachment
-- Automatically removes the one-time Scheduled Task
-- Includes a non-destructive dry-run mode
+```powershell
+$installer = Join-Path $env:TEMP 'Install-HermesSelfUpdate.ps1'
+Invoke-WebRequest -UseBasicParsing `
+  -Uri 'https://raw.githubusercontent.com/don040/HermesAgent-Selfupdate/main/Install-HermesSelfUpdate.ps1' `
+  -OutFile $installer
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $installer
+```
 
-## Safety Model
+Existing agents that have only `C:\Scripts\Hermes-SelfUpdate.ps1` are migrated
+safely; follow [INSTALL.md](INSTALL.md) instead of cloning over that directory.
 
-The script is designed to avoid updating Hermes from inside its own running process tree.
+Verify the result without starting an update:
 
-A normal destructive update can stop services, terminate Hermes-related processes, and replace files inside the Hermes installation. Running those operations directly from an active Hermes session could terminate the process responsible for performing the update or leave files locked.
+```powershell
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\scripts\Test-HermesSelfUpdateInstallation.ps1"
+```
 
-For this reason, the intended workflow is:
+## Installed flow
 
-1. Hermes starts the script with `-ScheduleOnly`.
-2. The script creates a one-time Scheduled Task.
-3. Windows launches a separate PowerShell process as `SYSTEM`.
-4. The scheduled process verifies that it is not running below a Hermes-owned parent process.
-5. The scheduled process performs the update.
-6. The one-time task removes itself after execution.
+```text
+Hermes-Agent-SelfUpdate-Daily (04:00, SYSTEM/Highest)
+  -> ProgramData supervisor
+       -> fetch + validated fast-forward of C:\scripts
+       -> exact commit snapshot + PowerShell parse check
+       -> Hermes-SelfUpdate.ps1 -FromScheduledTask
+            -> inspect gateway state
+            -> stop gateway and Hermes-owned processes
+            -> hermes update --yes --backup --force
+            -> restore only the captured gateway backend/state
+            -> verify, report, and notify when configured
+```
 
-Direct destructive execution is rejected unless the script was started with `-FromScheduledTask`.
+The supervisor fails closed. A network error, wrong remote, wrong branch,
+tracked local modification, non-fast-forward history, or invalid PowerShell file
+prevents the Hermes update from running with stale or unexpected code.
 
-> **Important:** Do not manually use `-FromScheduledTask` to bypass the safety checks. Use `-ScheduleOnly` for real updates.
+## Repository contents
 
-## Update Workflow
+- `Install-HermesSelfUpdate.ps1` — idempotent installation, legacy migration,
+  ACL hardening, and daily Task Scheduler registration
+- `Invoke-HermesSelfUpdate.ps1` — stable supervisor source; the installer copies
+  it outside the checkout
+- `Hermes-SelfUpdate.ps1` — destructive Hermes update core and direct dry-run
+- `Test-HermesSelfUpdateInstallation.ps1` — read-only deployment verification
+- `INSTALL.md` — complete rollout, migration, operation, and troubleshooting
+- `AGENTS.md` — concise rules for autonomous coding/operations agents
 
-During a normal update, the script performs the following operations:
+## Important defaults
 
-1. Initializes the Hermes environment for the Administrator installation.
-2. Locates the required Git executable.
-3. Collects the current Hermes version and revision.
-4. Measures the current installation size.
-5. Checks the Hermes gateway and Windows service state.
-6. Determines whether the gateway must be restarted later.
-7. Performs preflight checks and repairs the installation if required.
-8. Sends an optional Discord notification that the update has started.
-9. Stops all Hermes gateways through the Hermes CLI.
-10. Stops detected Hermes gateway services.
-11. Terminates remaining Hermes-owned processes.
-12. Runs:
+- Checkout: `C:\scripts`
+- State: `C:\ProgramData\HermesAgent-SelfUpdate`
+- Task: `Hermes-Agent-SelfUpdate-Daily`
+- Hermes user profile: `C:\Users\Administrator`
+- Gateway backend: official root task `Hermes_Gateway`; legacy Windows services
+  are also restored
+- Optional webhook variable: machine-scoped `HERMES_UPDATE_WEBHOOK_URL`
 
-   ```text
-   hermes update --yes --backup --force
+Do not put webhook values or other machine-specific configuration into the Git
+checkout. Do not invoke `-FromScheduledTask` manually. Use the installed task or
+the `-ScheduleOnly` compatibility entry point for a real run.
+
+For all prerequisites, migration behavior, parameters, log paths, manual-run
+commands, and the security model, see [INSTALL.md](INSTALL.md).

@@ -2,11 +2,20 @@ param(
     [switch]$ScheduleOnly,
     [switch]$FromScheduledTask,
     [switch]$DryRun,
-    [string]$WebhookUrl = ''
+    [string]$WebhookUrl = '',
+    [string]$HermesUserProfile = 'C:\Users\Administrator'
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+if ($ScheduleOnly -and $FromScheduledTask) {
+    throw '-ScheduleOnly and -FromScheduledTask cannot be used together.'
+}
+
+if ($ScheduleOnly -and $DryRun) {
+    throw '-ScheduleOnly always starts the installed real update task. Run -DryRun directly instead.'
+}
 
 $WebhookEnvironmentVariable = 'HERMES_UPDATE_WEBHOOK_URL'
 
@@ -22,7 +31,7 @@ if ([string]::IsNullOrWhiteSpace($WebhookUrl)) {
 }
 
 # ============================================================
-# Hermes Self Update - Safe Single File Runner
+# Hermes Self Update - Safe Core Runner
 #
 # Hermes should run only:
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\scripts\Hermes-SelfUpdate.ps1" -ScheduleOnly
@@ -31,23 +40,32 @@ if ([string]::IsNullOrWhiteSpace($WebhookUrl)) {
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\scripts\Hermes-SelfUpdate.ps1" -DryRun
 #
 # Destructive mode:
-#   Only allowed through Windows Task Scheduler with -FromScheduledTask
+#   Only allowed through the installed SYSTEM supervisor with -FromScheduledTask
 # ============================================================
 
-$HermesHome = 'C:\Users\Administrator\AppData\Local\hermes'
+$HermesUserProfile = [IO.Path]::GetFullPath(
+    [Environment]::ExpandEnvironmentVariables($HermesUserProfile)
+).TrimEnd('\')
+$HermesUserProfileRoot = [IO.Path]::GetPathRoot($HermesUserProfile)
+
+if ([string]::IsNullOrWhiteSpace($HermesUserProfileRoot) -or
+    $HermesUserProfile -eq $HermesUserProfileRoot.TrimEnd('\')) {
+    throw "HermesUserProfile must not be a filesystem root: $HermesUserProfile"
+}
+
+$HermesHome = Join-Path $HermesUserProfile 'AppData\Local\hermes'
 $HermesRepo = Join-Path $HermesHome 'hermes-agent'
 $HermesExe = Join-Path $HermesRepo 'venv\Scripts\hermes.exe'
 $HermesPython = Join-Path $HermesRepo 'venv\Scripts\python.exe'
 $HermesModule = 'hermes_cli.main'
-$HermesUserProfile = 'C:\Users\Administrator'
 
 function Initialize-HermesTaskEnvironment {
     # Scheduled tasks run as SYSTEM. Point Hermes and its child processes at
     # the Administrator installation and profile explicitly.
     $env:USERPROFILE = $HermesUserProfile
     $env:HOME = $HermesUserProfile
-    $env:HOMEDRIVE = 'C:'
-    $env:HOMEPATH = '\Users\Administrator'
+    $env:HOMEDRIVE = [IO.Path]::GetPathRoot($HermesUserProfile).TrimEnd('\')
+    $env:HOMEPATH = $HermesUserProfile.Substring($env:HOMEDRIVE.Length)
     $env:LOCALAPPDATA = Join-Path $HermesUserProfile 'AppData\Local'
     $env:APPDATA = Join-Path $HermesUserProfile 'AppData\Roaming'
     $env:HERMES_HOME = $HermesHome
@@ -88,25 +106,28 @@ function Initialize-HermesTaskEnvironment {
 $ScriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
 
 $LogDir = Join-Path $HermesHome 'logs'
-$LogFile = Join-Path $LogDir 'weekly-self-update.log'
-$ReportFile = Join-Path $LogDir 'weekly-self-update.report.txt'
+$LogFile = Join-Path $LogDir 'self-update.log'
+$ReportFile = Join-Path $LogDir 'self-update.report.txt'
 
-$UpdateOut = Join-Path $LogDir 'weekly-self-update.hermes.out.log'
-$UpdateErr = Join-Path $LogDir 'weekly-self-update.hermes.err.log'
+$UpdateOut = Join-Path $LogDir 'self-update.hermes.out.log'
+$UpdateErr = Join-Path $LogDir 'self-update.hermes.err.log'
 
-$GatewayStopOut = Join-Path $LogDir 'weekly-self-update.gateway-stop.out.log'
-$GatewayStopErr = Join-Path $LogDir 'weekly-self-update.gateway-stop.err.log'
+$GatewayStopOut = Join-Path $LogDir 'self-update.gateway-stop.out.log'
+$GatewayStopErr = Join-Path $LogDir 'self-update.gateway-stop.err.log'
 
-$GatewayStartOut = Join-Path $LogDir 'weekly-self-update.gateway-start.out.log'
-$GatewayStartErr = Join-Path $LogDir 'weekly-self-update.gateway-start.err.log'
+$GatewayStartOut = Join-Path $LogDir 'self-update.gateway-start.out.log'
+$GatewayStartErr = Join-Path $LogDir 'self-update.gateway-start.err.log'
 
-$GatewayStatusBeforeFile = Join-Path $LogDir 'weekly-self-update.gateway-status-before.log'
-$GatewayStatusAfterFile = Join-Path $LogDir 'weekly-self-update.gateway-status-after.log'
+$GatewayStatusBeforeFile = Join-Path $LogDir 'self-update.gateway-status-before.log'
+$GatewayStatusAfterFile = Join-Path $LogDir 'self-update.gateway-status-after.log'
 
 $UpdateTimeoutMinutes = 20
 $GatewayStartWaitSeconds = 15
-$ScheduledTaskName = 'Hermes-OneShot-SelfUpdate'
+$ScheduledTaskName = 'Hermes-Agent-SelfUpdate-Daily'
 $GatewayServiceName = 'Hermes_Gateway'
+$GatewayScheduledTaskName = 'Hermes_Gateway'
+$ManagedRepositoryUrl = 'https://github.com/don040/HermesAgent-Selfupdate.git'
+$script:UnterminatedHermesCommand = $false
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
@@ -209,6 +230,39 @@ function ConvertTo-HermesVersionInfo {
         Revision = $revision
         Raw      = $VersionText
     }
+}
+
+function Get-GatewayStatusState {
+    param(
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return 'Unknown'
+    }
+
+    # Match gateway-process liveness, not generic Scheduled Task text such as
+    # "Task Status: Running". Official Hermes output can show a registered
+    # task as running/ready while also saying that no gateway process exists.
+    $runningPattern = '(?im)^\s*[^\p{L}\p{N}\r\n]*\s*Gateway(?:\s+process)?\s+(?:(?:is|status:)\s+)?running\b'
+    $stoppedPattern = '(?im)^\s*[^\p{L}\p{N}\r\n]*\s*(?:No\s+gateway\s+process(?:es)?\s+detected\b|Gateway(?:\s+process)?\s+(?:(?:is|status:)\s+)?(?:not\s+running|stopped|inactive)\b)'
+    $hasRunningState = $Text -match $runningPattern
+    $hasStoppedState = $Text -match $stoppedPattern
+
+    if ($hasRunningState -and -not $hasStoppedState) { return 'Running' }
+    if ($hasStoppedState -and -not $hasRunningState) { return 'Stopped' }
+
+    return 'Unknown'
+}
+
+function Test-GatewayStatusIndicatesRunning {
+    param(
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    return (Get-GatewayStatusState -Text $Text) -eq 'Running'
 }
 
 function Get-ServiceProcessId {
@@ -323,11 +377,30 @@ function Test-IsHermesProcess {
         return $false
     }
 
-    if ($Process.ExecutablePath -and $Process.ExecutablePath -like "$HermesHome*") {
-        return $true
+    if ($Process.ExecutablePath) {
+        try {
+            $executablePath = [IO.Path]::GetFullPath($Process.ExecutablePath)
+            $homeBoundary = $HermesHome.TrimEnd('\') + '\'
+
+            if ($executablePath.Equals($HermesHome, [StringComparison]::OrdinalIgnoreCase) -or
+                $executablePath.StartsWith($homeBoundary, [StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+        catch {
+            # Fall through to the command-line check for malformed or missing
+            # executable paths returned by CIM.
+        }
     }
 
-    if ($Process.CommandLine -and $Process.CommandLine -like "*$HermesHome*") {
+    $escapedHome = [regex]::Escape($HermesHome.TrimEnd('\'))
+
+    $commandLinePattern = '(?i){0}(?:[\\/\s"]|$)' -f $escapedHome
+    $hermesCommandPattern = '(?i)(?:-m\s+hermes_cli(?:\.main)?\b|hermes(?:\.exe)?\s+gateway\b|gateway-service)'
+
+    if ($Process.CommandLine -and
+        $Process.CommandLine -match $commandLinePattern -and
+        $Process.CommandLine -match $hermesCommandPattern) {
         return $true
     }
 
@@ -354,6 +427,45 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$ScriptPath" -ScheduleO
 "@
     }
 
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+
+    if (-not $identity.User -or $identity.User.Value -ne 'S-1-5-18') {
+        throw @"
+Refusing destructive execution outside the installed LOCAL SYSTEM supervisor.
+
+Do not invoke -FromScheduledTask manually. Use:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$ScriptPath" -ScheduleOnly
+"@
+    }
+
+    if ([string]::IsNullOrWhiteSpace($env:HERMES_SELFUPDATE_SNAPSHOT_PATH) -or
+        [string]::IsNullOrWhiteSpace($env:HERMES_SELFUPDATE_SUPERVISOR_PATH) -or
+        $env:HERMES_SELFUPDATE_COMMIT -notmatch '^[0-9a-f]{40}$') {
+        throw 'Refusing destructive execution without a validated supervisor snapshot contract.'
+    }
+
+    $snapshotPath = [IO.Path]::GetFullPath($env:HERMES_SELFUPDATE_SNAPSHOT_PATH).TrimEnd('\')
+    $expectedCorePath = Join-Path $snapshotPath 'Hermes-SelfUpdate.ps1'
+    $actualCorePath = [IO.Path]::GetFullPath($ScriptPath)
+
+    if (-not $actualCorePath.Equals($expectedCorePath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing core outside the supervisor snapshot: $actualCorePath"
+    }
+
+    $snapshotItem = Get-Item -LiteralPath $snapshotPath -Force -ErrorAction Stop
+
+    if (-not $snapshotItem.PSIsContainer -or
+        ($snapshotItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Supervisor snapshot is not a safe directory: $snapshotPath"
+    }
+
+    $supervisorPath = [IO.Path]::GetFullPath($env:HERMES_SELFUPDATE_SUPERVISOR_PATH)
+
+    if ([IO.Path]::GetFileName($supervisorPath) -ine 'Invoke-HermesSelfUpdate.ps1' -or
+        -not (Test-Path -LiteralPath $supervisorPath -PathType Leaf)) {
+        throw "Supervisor contract points to an invalid runner: $supervisorPath"
+    }
+
     $chain = @(Get-ProcessChain)
 
     $badParents = @(
@@ -378,55 +490,52 @@ Use -ScheduleOnly so Windows Task Scheduler runs the destructive update outside 
     }
 }
 
-function Register-HermesSelfUpdateTask {
-    if (-not $ScriptPath -or -not (Test-Path $ScriptPath)) {
-        throw "Cannot determine script path. Save this script as a .ps1 file before using -ScheduleOnly."
+function Start-InstalledHermesSelfUpdateTask {
+    $task = Get-ScheduledTask `
+        -TaskPath '\' `
+        -TaskName $ScheduledTaskName `
+        -ErrorAction SilentlyContinue
+
+    if (-not $task) {
+        throw @"
+The installed daily task '$ScheduledTaskName' was not found.
+
+Run the elevated installer first:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\scripts\Install-HermesSelfUpdate.ps1"
+"@
     }
 
-    $runAt = (Get-Date).AddSeconds(30)
+    if ($task.Principal.UserId -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')) {
+        throw "Refusing to start task '$ScheduledTaskName' because its principal is not LOCAL SYSTEM."
+    }
 
-    $taskArgs = @(
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', "`"$ScriptPath`"",
-        '-FromScheduledTask'
-    ) -join ' '
+    if ($task.State.ToString() -eq 'Disabled' -or
+        ($null -ne $task.Settings.Enabled -and -not $task.Settings.Enabled)) {
+        throw "Refusing to start disabled task '$ScheduledTaskName'."
+    }
 
-    $action = New-ScheduledTaskAction `
-        -Execute 'powershell.exe' `
-        -Argument $taskArgs
+    $programData = if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' }
+    $expectedStatePath = Join-Path $programData 'HermesAgent-SelfUpdate'
+    $expectedSupervisor = Join-Path $expectedStatePath 'Invoke-HermesSelfUpdate.ps1'
+    $expectedPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $expectedInstallPath = Split-Path -Parent $ScriptPath
+    $actions = @($task.Actions)
 
-    $trigger = New-ScheduledTaskTrigger `
-        -Once `
-        -At $runAt
+    if ($actions.Count -ne 1 -or
+        $actions[0].Execute -ine $expectedPowerShell -or
+        $actions[0].WorkingDirectory -ine $expectedStatePath -or
+        $actions[0].Arguments.IndexOf($expectedSupervisor, [StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $actions[0].Arguments.IndexOf($expectedInstallPath, [StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $actions[0].Arguments.IndexOf($ManagedRepositoryUrl, [StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $actions[0].Arguments -match '(?i)Hermes-SelfUpdate\.ps1.*-FromScheduledTask') {
+        throw "Refusing task '$ScheduledTaskName' because its action does not use the installed refresh-first supervisor."
+    }
 
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId 'SYSTEM' `
-        -RunLevel Highest
+    Start-ScheduledTask -TaskPath '\' -TaskName $ScheduledTaskName
 
-    $settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 45)
-
-    $task = New-ScheduledTask `
-        -Action $action `
-        -Trigger $trigger `
-        -Principal $principal `
-        -Settings $settings
-
-    Register-ScheduledTask `
-        -TaskName $ScheduledTaskName `
-        -InputObject $task `
-        -Force | Out-Null
-
-    Start-ScheduledTask -TaskName $ScheduledTaskName
-
-    Write-Output "Hermes self-update scheduled."
+    Write-Output 'Hermes self-update task started.'
     Write-Output "Task: $ScheduledTaskName"
-    Write-Output "RunAt: $runAt"
-    Write-Output "Script: $ScriptPath"
+    Write-Output 'The supervisor will refresh the repository before running the update.'
 }
 
 function Invoke-HermesCommand {
@@ -470,16 +579,30 @@ function Invoke-HermesCommand {
     if (-not $proc.WaitForExit($timeoutMs)) {
         Write-Log "Command $Label timed out after $TimeoutMinutes minutes - killing PID $($proc.Id)"
 
+        $previousErrorActionPreference = $ErrorActionPreference
+        $taskkillExitCode = 1
+
         try {
-            & taskkill.exe /PID $proc.Id /T /F | Out-Null
+            $ErrorActionPreference = 'Continue'
+            & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null
+            $taskkillExitCode = $LASTEXITCODE
         }
-        catch {
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+
+        if ($taskkillExitCode -ne 0) {
             try {
                 Stop-Process -Id $proc.Id -Force -ErrorAction Stop
             }
             catch {
-                Write-Log "Stop-Process failed for PID $($proc.Id): $($_.Exception.Message)"
+                Write-Log "Stop-Process failed for timed-out PID $($proc.Id): $($_.Exception.Message)"
             }
+        }
+
+        if (-not $proc.WaitForExit(10000)) {
+            $script:UnterminatedHermesCommand = $true
+            throw "Timed-out command $Label could not be terminated safely (PID $($proc.Id))."
         }
 
         $exitCode = 124
@@ -526,10 +649,40 @@ function Invoke-HermesCommand {
 }
 
 function Get-HermesGatewayServices {
-    Get-Service | Where-Object {
-        ($_.Name -match 'hermes.*gateway|gateway.*hermes') -or
-        ($_.DisplayName -match 'hermes.*gateway|gateway.*hermes')
+    $service = Get-Service -Name $GatewayServiceName -ErrorAction SilentlyContinue
+
+    if (-not $service) {
+        return @()
     }
+
+    $escapedName = $GatewayServiceName.Replace("'", "''")
+    $serviceDefinition = Get-CimInstance `
+        -ClassName Win32_Service `
+        -Filter "Name='$escapedName'" `
+        -ErrorAction Stop
+
+    if (-not $serviceDefinition -or
+        [string]::IsNullOrWhiteSpace($serviceDefinition.PathName)) {
+        throw "Legacy gateway service definition could not be validated: $GatewayServiceName"
+    }
+
+    $escapedHome = [regex]::Escape($HermesHome.TrimEnd('\'))
+    $servicePathPattern = '(?i){0}(?:[\\/\s"]|$)' -f $escapedHome
+
+    if ($serviceDefinition.PathName -notmatch $servicePathPattern -or
+        $serviceDefinition.PathName -notmatch '(?i)gateway') {
+        throw "Legacy gateway service does not point to the configured Hermes installation: $($serviceDefinition.PathName)"
+    }
+
+    $expectedProfileUser = Split-Path -Leaf $HermesUserProfile
+    $serviceUser = [string]$serviceDefinition.StartName
+
+    if ($serviceUser -notin @('LocalSystem', 'NT AUTHORITY\SYSTEM', '.\LocalSystem') -and
+        ($serviceUser -split '\\')[-1] -ine $expectedProfileUser) {
+        throw "Legacy gateway service uses an unexpected account: $serviceUser"
+    }
+
+    return @($service)
 }
 
 function Get-HermesProcesses {
@@ -561,15 +714,24 @@ function Stop-HermesProcesses {
             [void]$killed.Add($entry)
             Write-Event "Killing lingering Hermes process: $entry"
 
+            $previousErrorActionPreference = $ErrorActionPreference
+            $taskkillExitCode = 1
+
             try {
-                & taskkill.exe /PID $proc.ProcessId /T /F | Out-Null
+                $ErrorActionPreference = 'Continue'
+                & taskkill.exe /PID $proc.ProcessId /T /F 2>&1 | Out-Null
+                $taskkillExitCode = $LASTEXITCODE
             }
-            catch {
+            finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+
+            if ($taskkillExitCode -ne 0) {
                 try {
                     Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
                 }
                 catch {
-                    Write-Log "Stop-Process failed for PID $($proc.ProcessId): $($_.Exception.Message)"
+                    Write-Log "Could not terminate PID $($proc.ProcessId); taskkill exit=$taskkillExitCode; Stop-Process error=$($_.Exception.Message)"
                 }
             }
         }
@@ -618,82 +780,251 @@ function Send-DiscordWebhookReport {
         "${WebhookUrl}?wait=true"
     }
 
-    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
-        # Passing inline JSON to a native executable loses embedded quotes in
-        # Windows PowerShell 5.1. Let curl read UTF-8 JSON from a temporary
-        # file so Discord receives valid multipart payload_json data.
-        $payloadFile = Join-Path `
-        ([IO.Path]::GetTempPath()) `
-        ("hermes-webhook-" + [guid]::NewGuid().ToString('N') + '.json')
+    # Keep the secret webhook URL out of native process command lines. The
+    # managed HTTP client supports the same multipart payload and attachment
+    # without exposing the endpoint through curl.exe argv or process telemetry.
+    Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
 
+    $client = $null
+    $multipart = $null
+    $response = $null
+
+    try {
+        $client = New-Object System.Net.Http.HttpClient
+        $multipart = New-Object System.Net.Http.MultipartFormDataContent
+        $payloadContent = New-Object System.Net.Http.StringContent -ArgumentList @(
+            $payload,
+            [Text.Encoding]::UTF8,
+            'application/json'
+        )
+        $multipart.Add($payloadContent, 'payload_json')
+
+        if ($AttachmentPath) {
+            $fileStream = [IO.File]::Open(
+                $AttachmentPath,
+                [IO.FileMode]::Open,
+                [IO.FileAccess]::Read,
+                [IO.FileShare]::Read
+            )
+            $fileContent = New-Object System.Net.Http.StreamContent($fileStream)
+            $fileContent.Headers.ContentType = New-Object `
+                System.Net.Http.Headers.MediaTypeHeaderValue('text/plain')
+            $multipart.Add(
+                $fileContent,
+                'file1',
+                'hermes-update-report.txt'
+            )
+        }
+
+        $response = $client.PostAsync($endpoint, $multipart).GetAwaiter().GetResult()
+        $responseText = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $responseText = $responseText.TrimEnd()
+
+        if ($responseText) {
+            Write-Log "Webhook response: $responseText"
+        }
+
+        return [pscustomobject]@{
+            ExitCode = if ($response.IsSuccessStatusCode) { 0 } else { 22 }
+            Response = $responseText
+        }
+    }
+    finally {
+        if ($response) {
+            $response.Dispose()
+        }
+
+        if ($multipart) {
+            # Disposing the multipart content also disposes payload/file
+            # content and the attachment stream, if one was created.
+            $multipart.Dispose()
+        }
+
+        if ($client) {
+            $client.Dispose()
+        }
+    }
+}
+
+function Get-HermesGatewayScheduledTasks {
+    return @(
+        Get-ScheduledTask -TaskPath '\' -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.TaskName -eq $GatewayScheduledTaskName -or
+                $_.TaskName -like "${GatewayScheduledTaskName}_*"
+            }
+    )
+}
+
+function Assert-OfficialHermesGatewayScheduledTask {
+    param([Parameter(Mandatory = $true)][object]$Task)
+
+    if ($Task.TaskPath -ne '\') {
+        throw "Gateway Scheduled Task is outside the expected root TaskPath: $($Task.TaskPath)$($Task.TaskName)"
+    }
+
+    $principalUser = $Task.Principal.UserId
+    $principalAccount = $principalUser
+    $logonType = $Task.Principal.LogonType.ToString()
+    $runLevel = $Task.Principal.RunLevel.ToString()
+    $expectedProfileUser = Split-Path -Leaf $HermesUserProfile
+
+    if ($principalUser -in @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')) {
+        throw "Refusing gateway Scheduled Task configured as LOCAL SYSTEM: $($Task.TaskName)"
+    }
+
+    if ($principalUser -match '^S-1-') {
         try {
-            [IO.File]::WriteAllText(
-                $payloadFile,
-                $payload,
-                (New-Object Text.UTF8Encoding($false))
-            )
-
-            $curlArgs = @(
-                '--silent',
-                '--show-error',
-                '--fail-with-body',
-                '-F', "payload_json=<$payloadFile;type=application/json"
-            )
-
-            if ($AttachmentPath) {
-                $curlArgs += @(
-                    '-F',
-                    "file1=@$AttachmentPath;filename=hermes-update-report.txt;type=text/plain"
-                )
-            }
-
-            $curlArgs += $endpoint
-
-            $response = & curl.exe @curlArgs 2>&1
-            $exitCode = $LASTEXITCODE
-
-            $responseText = (($response | ForEach-Object {
-                        $_.ToString()
-                    }) -join "`r`n").TrimEnd()
-
-            if ($responseText) {
-                Write-Log "Webhook response: $responseText"
-            }
-
-            return [pscustomobject]@{
-                ExitCode = $exitCode
-                Response = $responseText
-            }
+            $principalAccount = (
+                New-Object Security.Principal.SecurityIdentifier($principalUser)
+            ).Translate([Security.Principal.NTAccount]).Value
         }
-        finally {
-            Remove-Item `
-                -LiteralPath $payloadFile `
-                -Force `
-                -ErrorAction SilentlyContinue
+        catch {
+            throw "Gateway Scheduled Task user SID could not be resolved: $principalUser"
         }
     }
 
-    $fallbackBody = @{}
-
-    if ($null -ne $Embed) {
-        $fallbackBody.embeds = @($Embed)
-    }
-    else {
-        $fallbackBody.content = $Summary
+    if ($logonType -notmatch '(?i)Interactive' -or $runLevel -notmatch '(?i)Limited') {
+        throw "Gateway Scheduled Task has an unexpected principal contract: user=$principalUser logon=$logonType runLevel=$runLevel"
     }
 
-    $fallbackBody = $fallbackBody | ConvertTo-Json -Depth 10
-
-    $fallback = Invoke-RestMethod `
-        -Uri $endpoint `
-        -Method Post `
-        -ContentType 'application/json' `
-        -Body $fallbackBody
-
-    return [pscustomobject]@{
-        ExitCode = 0
-        Response = ($fallback | Out-String).TrimEnd()
+    if (($principalAccount -split '\\')[-1] -ine $expectedProfileUser) {
+        throw "Gateway Scheduled Task user '$principalUser' does not match HermesUserProfile '$HermesUserProfile'."
     }
+
+    if ($Task.State.ToString() -eq 'Disabled' -or
+        ($null -ne $Task.Settings.Enabled -and -not $Task.Settings.Enabled)) {
+        throw "Gateway Scheduled Task is disabled: $($Task.TaskName)"
+    }
+
+    $actions = @($Task.Actions)
+
+    if ($actions.Count -ne 1) {
+        throw "Gateway Scheduled Task must have exactly one action: $($Task.TaskName)"
+    }
+
+    $systemWscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    $taskExecutable = $actions[0].Execute.Trim('"')
+
+    if (($taskExecutable -ine 'wscript.exe' -and
+         $taskExecutable -ine $systemWscript)) {
+        throw "Gateway Scheduled Task has an unexpected executable: $($Task.TaskName)"
+    }
+
+    $expectedVbs = Join-Path $HermesHome ("gateway-service\{0}.vbs" -f $Task.TaskName)
+    $expectedArguments = '//B //Nologo "{0}"' -f $expectedVbs
+
+    if ($actions[0].Arguments.Trim() -ine $expectedArguments) {
+        throw "Gateway Scheduled Task does not have the expected wrapper arguments: $expectedArguments"
+    }
+
+    if (-not (Test-Path -LiteralPath $expectedVbs -PathType Leaf)) {
+        throw "Gateway Scheduled Task wrapper is missing: $expectedVbs"
+    }
+
+    $wrapperItem = Get-Item -LiteralPath $expectedVbs -Force
+
+    if (($wrapperItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Gateway Scheduled Task wrapper must not be a reparse point: $expectedVbs"
+    }
+}
+
+function Restore-HermesGatewayBackend {
+    param(
+        [string]$Mode,
+        [object[]]$Services = @(),
+        [object[]]$ScheduledTasks = @()
+    )
+
+    $restored = $true
+
+    if ($Mode -eq 'service') {
+        foreach ($service in $Services) {
+            try {
+                $current = Get-Service -Name $service.Name -ErrorAction Stop
+
+                if ($current.Status.ToString() -ne 'Running') {
+                    Write-Event "Restoring gateway service $($service.Name)"
+                    Start-Service -Name $service.Name -ErrorAction Stop
+                }
+
+                $current = Get-Service -Name $service.Name -ErrorAction Stop
+
+                if ($current.Status.ToString() -ne 'Running') {
+                    $restored = $false
+                    Write-Log "Gateway service did not reach RUNNING during safety restoration: $($service.Name)"
+                }
+            }
+            catch {
+                $restored = $false
+                Write-Log "Could not restore gateway service $($service.Name): $($_.Exception.Message)"
+            }
+        }
+    }
+    elseif ($Mode -eq 'scheduled-task') {
+        try {
+            $status = Invoke-HermesCommand `
+                -Label 'gateway-status-before-finally-restore' `
+                -Arguments @('gateway', 'status', '--full') `
+                -TimeoutMinutes 2
+            $statusText = "$($status.StdOut)`r`n$($status.StdErr)"
+
+            if ($status.ExitCode -eq 0 -and
+                (Test-GatewayStatusIndicatesRunning -Text $statusText)) {
+                return $true
+            }
+        }
+        catch {
+            Write-Log "Could not check gateway before Scheduled Task restoration: $($_.Exception.Message)"
+        }
+
+        foreach ($task in $ScheduledTasks) {
+            try {
+                [void](Get-ScheduledTask `
+                    -TaskPath $task.TaskPath `
+                    -TaskName $task.TaskName `
+                    -ErrorAction Stop)
+                Write-Event "Restoring gateway Scheduled Task $($task.TaskPath)$($task.TaskName)"
+                Start-ScheduledTask `
+                    -TaskPath $task.TaskPath `
+                    -TaskName $task.TaskName `
+                    -ErrorAction Stop
+            }
+            catch {
+                $restored = $false
+                Write-Log "Could not restore gateway Scheduled Task $($task.TaskPath)$($task.TaskName): $($_.Exception.Message)"
+            }
+        }
+
+        if ($restored) {
+            $gatewayConfirmed = $false
+
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                Start-Sleep -Seconds 5
+
+                try {
+                    $status = Invoke-HermesCommand `
+                        -Label 'gateway-status-after-finally-restore' `
+                        -Arguments @('gateway', 'status', '--full') `
+                        -TimeoutMinutes 2
+                    $statusText = "$($status.StdOut)`r`n$($status.StdErr)"
+
+                    if ($status.ExitCode -eq 0 -and
+                        (Test-GatewayStatusIndicatesRunning -Text $statusText)) {
+                        $gatewayConfirmed = $true
+                        break
+                    }
+                }
+                catch {
+                    Write-Log "Gateway restoration check $attempt failed: $($_.Exception.Message)"
+                }
+            }
+
+            $restored = $gatewayConfirmed
+        }
+    }
+
+    return $restored
 }
 
 function Get-UvExecutable {
@@ -718,323 +1049,12 @@ function Get-UvExecutable {
     return $null
 }
 
-function Repair-HermesInstallation {
-    param([string[]]$Reasons)
-
-    $started = Get-Date
-    $yellow = [char]::ConvertFromUtf32(0x1F7E1)
-    $green = [char]::ConvertFromUtf32(0x1F7E2)
-    $red = [char]::ConvertFromUtf32(0x1F534)
-    $check = [char]::ConvertFromUtf32(0x2705)
-    $cross = [char]::ConvertFromUtf32(0x274C)
-    $installerUrl = 'https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1'
-    $reasonText = ($Reasons | Where-Object { $_ }) -join "`n"
-
-    $startEmbed = @{
-        title       = "$yellow Hermes Repair Started"
-        description = 'A clean Hermes installation will be built in an isolated temporary directory.'
-        color       = 16705372
-        timestamp   = $started.ToUniversalTime().ToString('o')
-        fields      = @(
-            @{ name = 'Detected Issue'; value = $reasonText; inline = $false },
-            @{ name = 'Official Source'; value = 'NousResearch/hermes-agent Windows installer (main branch)'; inline = $false },
-            @{ name = 'Safety Policy'; value = 'Existing installation files are never overwritten. Only missing source files are added. User data and configuration are outside the repair copy scope.'; inline = $false },
-            @{ name = 'Launcher Handling'; value = 'The launcher is regenerated for the existing target venv; a launcher from the temporary venv is never copied.'; inline = $false }
-        )
-        footer      = @{ text = "$env:COMPUTERNAME | Hermes Repair Observer" }
-    }
-
-    try {
-        [void](Send-DiscordWebhookReport -Embed $startEmbed)
-        Write-Event 'Repair start webhook sent.'
-    }
-    catch {
-        Write-Event "Repair start webhook failed: $($_.Exception.Message)"
-    }
-
-    $added = New-Object System.Collections.Generic.List[string]
-    $errors = New-Object System.Collections.Generic.List[string]
-    $stages = New-Object System.Collections.Generic.List[string]
-    $launcherExit = $null
-    $version = 'not available'
-    $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-    $tempRoot = Join-Path $tempBase ("HermesRepair-" + [guid]::NewGuid().ToString('N'))
-    $tempHome = Join-Path $tempRoot 'home'
-    $tempInstall = Join-Path $tempRoot 'hermes-agent'
-    $installer = Join-Path $tempRoot 'install.ps1'
-
-    try {
-        New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
-        Write-Event "Downloading official Hermes installer to: $installer"
-        Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing -ErrorAction Stop
-
-        # The official stage runner refreshes PATH from the registry. Under a
-        # SYSTEM task that hides the already configured portable Git and uv
-        # paths inherited from this script. Patch only the disposable Temp
-        # copy so it appends registry PATH instead of discarding inherited PATH.
-        $installerText = [IO.File]::ReadAllText($installer)
-        $syncPathPattern = 'function\s+Sync-EnvPath\s*\{\s*\$env:Path\s*=\s*\[Environment\]::GetEnvironmentVariable\("Path",\s*"User"\)\s*\+\s*";"\s*\+\s*\[Environment\]::GetEnvironmentVariable\("Path",\s*"Machine"\)\s*\}'
-        $syncPathReplacement = 'function Sync-EnvPath { $registryPath = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine"); $env:Path = $env:Path + ";" + $registryPath }'
-        $syncPathRegex = [regex]::new($syncPathPattern)
-        $syncPathMatches = $syncPathRegex.Matches($installerText)
-
-        if ($syncPathMatches.Count -ne 1) {
-            throw 'Official installer Sync-EnvPath implementation changed; refusing an unverified compatibility patch.'
-        }
-
-        $installerText = $syncPathRegex.Replace(
-            $installerText,
-            { param($match) $syncPathReplacement },
-            1
-        )
-        [IO.File]::WriteAllText(
-            $installer,
-            $installerText,
-            (New-Object Text.UTF8Encoding($false))
-        )
-        Write-Event 'Applied Temp-only SYSTEM PATH compatibility patch to official installer.'
-
-        foreach ($stage in @('repository', 'venv', 'dependencies')) {
-            $outFile = Join-Path $tempRoot "$stage.out.log"
-            $errFile = Join-Path $tempRoot "$stage.err.log"
-            $arguments = @(
-                '-NoProfile', '-ExecutionPolicy', 'Bypass',
-                '-File', $installer,
-                '-Stage', $stage,
-                '-NonInteractive', '-SkipSetup',
-                '-HermesHome', $tempHome,
-                '-InstallDir', $tempInstall
-            )
-
-            Write-Event "Running official installer stage in temp: $stage"
-            $process = Start-Process `
-                -FilePath 'powershell.exe' `
-                -ArgumentList (ConvertTo-CommandLine -Arguments $arguments) `
-                -WorkingDirectory $tempRoot `
-                -WindowStyle Hidden `
-                -RedirectStandardOutput $outFile `
-                -RedirectStandardError $errFile `
-                -PassThru -Wait
-            $process.Refresh()
-            $exitCode = [int]$process.ExitCode
-            [void]$stages.Add("$stage=$exitCode")
-
-            foreach ($path in @($outFile, $errFile)) {
-                if (Test-Path -LiteralPath $path) {
-                    foreach ($line in Get-Content -LiteralPath $path -Encoding UTF8) {
-                        Write-Log "Repair installer [$stage]: $line"
-                    }
-                }
-            }
-
-            if ($exitCode -ne 0) {
-                $stageDetails = @()
-
-                foreach ($path in @($outFile, $errFile)) {
-                    if (Test-Path -LiteralPath $path) {
-                        $stageDetails += Get-Content -LiteralPath $path -Encoding UTF8
-                    }
-                }
-
-                $stageDetailText = ($stageDetails -join "`n").Trim()
-
-                if ($stageDetailText.Length -gt 1200) {
-                    $stageDetailText = $stageDetailText.Substring($stageDetailText.Length - 1200)
-                }
-
-                throw "Official installer stage '$stage' failed with exit code $exitCode. Details: $stageDetailText"
-            }
-        }
-
-        if (-not (Test-Path -LiteralPath $tempInstall -PathType Container)) {
-            throw "Temporary Hermes installation missing: $tempInstall"
-        }
-
-        $prefixLength = $tempInstall.TrimEnd('\').Length
-
-        foreach ($source in Get-ChildItem -LiteralPath $tempInstall -Recurse -File -Force) {
-            $relative = $source.FullName.Substring($prefixLength).TrimStart('\')
-
-            if ($relative -like '.git\*' -or $relative -like 'venv\*' -or $relative -like 'node_modules\*') {
-                continue
-            }
-
-            $destination = Join-Path $HermesRepo $relative
-
-            if (Test-Path -LiteralPath $destination) {
-                continue
-            }
-
-            $parent = Split-Path $destination -Parent
-            if (-not (Test-Path -LiteralPath $parent)) {
-                New-Item -ItemType Directory -Path $parent -Force | Out-Null
-            }
-
-            # The false overwrite flag guarantees an existing file is never replaced.
-            [IO.File]::Copy($source.FullName, $destination, $false)
-            [void]$added.Add($relative)
-            Write-Event "Added missing Hermes source file: $relative"
-        }
-
-        if (-not (Test-Path -LiteralPath $HermesPython)) {
-            throw "Existing target venv Python is missing: $HermesPython"
-        }
-
-        $uv = Get-UvExecutable
-        if (-not $uv) {
-            throw 'uv.exe was not found; launcher regeneration cannot continue.'
-        }
-
-        $launcherOut = Join-Path $tempRoot 'launcher.out.log'
-        $launcherErr = Join-Path $tempRoot 'launcher.err.log'
-        $launcherArgs = @(
-            'pip', 'install',
-            '--python', $HermesPython,
-            '--reinstall-package', 'hermes-agent',
-            '--no-deps',
-            '--editable', $HermesRepo
-        )
-
-        Write-Event 'Regenerating hermes.exe for the existing target venv.'
-        $launcherProcess = Start-Process `
-            -FilePath $uv `
-            -ArgumentList (ConvertTo-CommandLine -Arguments $launcherArgs) `
-            -WorkingDirectory $HermesRepo `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $launcherOut `
-            -RedirectStandardError $launcherErr `
-            -PassThru -Wait
-        $launcherProcess.Refresh()
-        $launcherExit = [int]$launcherProcess.ExitCode
-
-        foreach ($path in @($launcherOut, $launcherErr)) {
-            if (Test-Path -LiteralPath $path) {
-                foreach ($line in Get-Content -LiteralPath $path -Encoding UTF8) {
-                    Write-Log "Repair launcher: $line"
-                }
-            }
-        }
-
-        if ($launcherExit -ne 0) {
-            throw "Launcher regeneration failed with exit code $launcherExit."
-        }
-        if (-not (Test-Path -LiteralPath $HermesExe)) {
-            throw "Launcher is still missing: $HermesExe"
-        }
-
-        $versionOut = Join-Path $tempRoot 'version.out.log'
-        $versionErr = Join-Path $tempRoot 'version.err.log'
-        $versionProcess = Start-Process `
-            -FilePath $HermesPython `
-            -ArgumentList (ConvertTo-CommandLine -Arguments @('-m', $HermesModule, '--version')) `
-            -WorkingDirectory $HermesRepo `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $versionOut `
-            -RedirectStandardError $versionErr `
-            -PassThru -Wait
-        $versionProcess.Refresh()
-
-        if ($versionProcess.ExitCode -eq 0 -and (Test-Path -LiteralPath $versionOut)) {
-            $line = Get-Content -LiteralPath $versionOut -Encoding UTF8 | Select-Object -First 1
-            if ($line) { $version = $line.Trim() }
-        }
-    }
-    catch {
-        [void]$errors.Add($_.Exception.Message)
-        Write-Event "Hermes repair failed: $($_.Exception.Message)"
-    }
-    finally {
-        try {
-            $resolved = [IO.Path]::GetFullPath($tempRoot)
-            $safePrefix = $tempBase.TrimEnd('\') + '\'
-
-            if (
-                $resolved.StartsWith($safePrefix, [StringComparison]::OrdinalIgnoreCase) -and
-                (Split-Path $resolved -Leaf) -like 'HermesRepair-*'
-            ) {
-                Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
-                Write-Log "Removed isolated repair temp directory: $resolved"
-            }
-            else {
-                Write-Log "Refused unsafe temp cleanup path: $resolved"
-            }
-        }
-        catch {
-            Write-Log "Could not remove repair temp directory: $($_.Exception.Message)"
-        }
-    }
-
-    $success = $errors.Count -eq 0 -and (Test-Path -LiteralPath $HermesExe)
-    $finished = Get-Date
-    $duration = Format-Duration -Duration ($finished - $started)
-    $preview = if ($added.Count -eq 0) { 'None required' } else { $added -join "`n" }
-    if ($preview.Length -gt 900) { $preview = $preview.Substring(0, 897) + '...' }
-    $symbol = if ($success) { $green } else { $red }
-    $word = if ($success) { 'SUCCESS' } else { 'FAILED' }
-    $result = if ($success) { "$check SUCCESS" } else { "$cross FAILED" }
-    $errorText = if ($errors.Count -eq 0) { 'None' } else { $errors -join "`n" }
-    $launcher = if (Test-Path -LiteralPath $HermesExe) { 'PRESENT' } else { 'MISSING' }
-
-    $resultEmbed = @{
-        title       = "$symbol Hermes Repair $word"
-        description = if ($success) {
-            'The isolated repair completed successfully. The normal update will now continue.'
-        }
-        else {
-            'The isolated repair failed. The update has been stopped to protect the installation.'
-        }
-        color       = if ($success) { 5763719 } else { 15548997 }
-        timestamp   = $finished.ToUniversalTime().ToString('o')
-        fields      = @(
-            @{ name = 'Result'; value = $result; inline = $true },
-            @{ name = 'Duration'; value = $duration; inline = $true },
-            @{ name = 'Launcher'; value = $launcher; inline = $true },
-            @{ name = 'Missing Source Files Added'; value = "$($added.Count)"; inline = $true },
-            @{ name = 'Existing Files Overwritten'; value = '0'; inline = $true },
-            @{ name = 'Launcher Exit'; value = if ($null -eq $launcherExit) { 'not run' } else { "$launcherExit" }; inline = $true },
-            @{ name = 'Installer Stages'; value = if ($stages.Count -eq 0) { 'not run' } else { $stages -join ' | ' }; inline = $false },
-            @{ name = 'Files Added'; value = $preview; inline = $false },
-            @{ name = 'Hermes Version'; value = $version; inline = $false },
-            @{ name = 'Errors'; value = $errorText; inline = $false }
-        )
-        footer      = @{ text = "$env:COMPUTERNAME | Hermes Repair Observer" }
-    }
-
-    try {
-        [void](Send-DiscordWebhookReport -Embed $resultEmbed)
-        Write-Event "Repair result webhook sent; success=$success"
-    }
-    catch {
-        Write-Event "Repair result webhook failed: $($_.Exception.Message)"
-    }
-
-    Add-ReportSection 'Preflight repair'
-    Add-ReportLine "Success: $success"
-    Add-ReportLine "Reasons: $($Reasons -join '; ')"
-    Add-ReportLine "Official installer: $installerUrl"
-    Add-ReportLine "Installer stages: $($stages -join '; ')"
-    Add-ReportLine "Missing source files added: $($added.Count)"
-    Add-ReportLine 'Existing source files overwritten: 0'
-    Add-ReportLine "Launcher: $launcher"
-    Add-ReportLine "Launcher exit: $launcherExit"
-    Add-ReportLine "Version after repair: $version"
-    Add-ReportLine "Errors: $errorText"
-    Save-Report
-
-    return [pscustomobject]@{
-        Success        = $success
-        RestoredFiles  = $added.ToArray()
-        LauncherStatus = $launcher
-        Version        = $version
-        Errors         = $errors.ToArray()
-    }
-}
 # ============================================================
 # Safe scheduling mode
 # ============================================================
 
 if ($ScheduleOnly) {
-    Register-HermesSelfUpdateTask
+    Start-InstalledHermesSelfUpdateTask
     exit 0
 }
 
@@ -1048,7 +1068,7 @@ $GitExe = Initialize-HermesTaskEnvironment
 $RunStartedAt = Get-Date
 $InstallSizeBeforeBytes = Get-DirectorySizeBytes -Path $HermesRepo
 
-Write-Event '=== weekly update run started ==='
+Write-Event '=== self-update run started ==='
 Write-Event "HermesHome=$HermesHome"
 Write-Event "HermesRepo=$HermesRepo"
 Write-Event "HermesExe=$HermesExe"
@@ -1065,38 +1085,46 @@ if (-not (Test-Path -LiteralPath $HermesExe)) {
     [void]$repairReasons.Add("Hermes command launcher is missing: $HermesExe")
 }
 
-$repairPerformed = $repairReasons.Count -gt 0
+$repairRequired = $repairReasons.Count -gt 0
 $repairStatusText = 'Not required'
 
-if ($repairPerformed) {
-    Write-Event "Preflight repair required: $($repairReasons -join '; ')"
-    $repairResult = Repair-HermesInstallation -Reasons $repairReasons.ToArray()
+if ($repairRequired) {
+    Write-Event "Manual repair required: $($repairReasons -join '; ')"
 
-    if (-not $repairResult.Success) {
-        $repairStatusText = 'FAILED'
-        Write-Event 'Preflight repair failed; update aborted.'
+    if ($DryRun) {
+        $repairStatusText = "WOULD BE REQUIRED ($($repairReasons -join '; '))"
+        Write-Event 'DryRun: no repair was started.'
+    }
+    else {
+        $repairStatusText = 'REQUIRED - automatic repair disabled'
+        Write-Event 'Automatic SYSTEM repair is disabled; update aborted before gateway mutation.'
+        Add-ReportSection 'Manual repair required'
+        Add-ReportLine ($repairReasons -join '; ')
+        Add-ReportLine 'Repair Hermes explicitly, verify the installation, then rerun the scheduled task.'
         Save-Report
         exit 6
     }
-
-    $repairStatusText = "SUCCESS ($($repairResult.RestoredFiles.Count) missing source file(s) added)"
-    Write-Event "Preflight repair succeeded: $repairStatusText"
 }
 
 if (-not (Test-Path -LiteralPath $HermesPython)) {
-    Write-Event "Hermes Python interpreter not found; automatic repair was not started because hermes.exe exists: $HermesPython"
+    Write-Event "Hermes Python interpreter not found; manual repair is required: $HermesPython"
 
-    try {
-        $failureSymbol = [char]::ConvertFromUtf32(0x274C)
-        $failureText = "$failureSymbol **Hermes Self-Update could not start**`n`nHermes Python interpreter not found:`n``$HermesPython`` `n`nAutomatic repair was not started because ``hermes.exe`` is present.`nHost: ``$env:COMPUTERNAME``"
-        [void](Send-DiscordWebhookReport -Summary $failureText)
+    if ($DryRun) {
+        Write-Event 'DryRun: missing Hermes Python was reported without changing the installation.'
     }
-    catch {
-        Write-Log "Startup failure webhook could not be sent: $($_.Exception.Message)"
-    }
+    else {
+        try {
+            $failureSymbol = [char]::ConvertFromUtf32(0x274C)
+            $failureText = "$failureSymbol **Hermes Self-Update could not start**`n`nHermes Python interpreter not found:`n``$HermesPython`` `n`nAutomatic repair was not started because ``hermes.exe`` is present.`nHost: ``$env:COMPUTERNAME``"
+            [void](Send-DiscordWebhookReport -Summary $failureText)
+        }
+        catch {
+            Write-Log "Startup failure webhook could not be sent: $($_.Exception.Message)"
+        }
 
-    Save-Report
-    exit 2
+        Save-Report
+        exit 2
+    }
 }
 
 $EmojiRocket = [char]::ConvertFromUtf32(0x1F680)
@@ -1265,7 +1293,12 @@ Save-Report
 
 $gatewayStatusBefore = $null
 $gatewayServices = @()
+$runningGatewayServices = @()
+$gatewayScheduledTasks = @()
+$capturedGatewayScheduledTasks = @()
 $gatewayWasRunning = $false
+$gatewayStateKnown = $false
+$gatewayStatusState = 'Unknown'
 $restartMode = 'none'
 
 try {
@@ -1294,19 +1327,162 @@ try {
         Add-ReportBlock -Title 'Gateway status before update - stderr' -Text $gatewayStatusBefore.StdErr
     }
 
-    $gatewayWasRunning = ($gatewayStatusBefore.StdOut -match '(?i)running') -or ($gatewayStatusBefore.StdErr -match '(?i)running')
+    if ($gatewayStatusBefore.ExitCode -eq 0) {
+        $gatewayStatusCombined = "$($gatewayStatusBefore.StdOut)`r`n$($gatewayStatusBefore.StdErr)"
+        $gatewayStatusState = Get-GatewayStatusState -Text $gatewayStatusCombined
+
+        if ($gatewayStatusState -eq 'Unknown') {
+            Write-Event 'Gateway status output did not contain a recognized running/stopped state.'
+        }
+        else {
+            $gatewayWasRunning = $gatewayStatusState -eq 'Running'
+            $gatewayStateKnown = $true
+        }
+    }
+    else {
+        Write-Event 'Gateway status command failed; service discovery must establish a safe state before the update can continue.'
+    }
 }
 catch {
     Write-Event "Gateway status before update failed: $($_.Exception.Message)"
 }
 
-$gatewayServices = @(Get-HermesGatewayServices)
+if ($script:UnterminatedHermesCommand) {
+    Write-Event 'Gateway status command could not be terminated; refusing all gateway and update mutations.'
+    Add-ReportSection 'Safety abort'
+    Add-ReportLine 'A timed-out preflight command may still be active.'
+    Save-Report
+    exit 7
+}
 
-if ($gatewayServices.Count -gt 0) {
+try {
+    $gatewayServices = @(Get-HermesGatewayServices)
+}
+catch {
+    Write-Event "Legacy gateway service validation failed: $($_.Exception.Message)"
+    Add-ReportSection 'Safety abort'
+    Add-ReportLine $_.Exception.Message
+    Save-Report
+    exit 7
+}
+
+$runningGatewayServices = @(
+    $gatewayServices | Where-Object { $_.Status.ToString() -eq 'Running' }
+)
+$gatewayScheduledTasks = @(Get-HermesGatewayScheduledTasks)
+
+$gatewayServiceDirectory = Join-Path $HermesHome 'gateway-service'
+$startupDirectory = Join-Path $HermesUserProfile 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
+$unsupportedGatewayArtifacts = @()
+
+if (Test-Path -LiteralPath $gatewayServiceDirectory -PathType Container) {
+    $unsupportedGatewayArtifacts += @(
+        Get-ChildItem `
+            -LiteralPath $gatewayServiceDirectory `
+            -File `
+            -Force `
+            -ErrorAction Stop |
+            Where-Object { $_.Name -like "${GatewayScheduledTaskName}_*" }
+    )
+}
+
+if (Test-Path -LiteralPath $startupDirectory -PathType Container) {
+    $unsupportedGatewayArtifacts += @(
+        Get-ChildItem `
+            -LiteralPath $startupDirectory `
+            -File `
+            -Force `
+            -ErrorAction Stop |
+            Where-Object { $_.Name -like "${GatewayScheduledTaskName}*" }
+    )
+}
+
+$profiledGatewayProcesses = @(
+    Get-HermesProcesses | Where-Object {
+        $_.CommandLine -and
+        $_.CommandLine -match '(?i)(?:^|\s)--profile(?:=|\s)'
+    }
+)
+
+if ($unsupportedGatewayArtifacts.Count -gt 0 -or
+    $profiledGatewayProcesses.Count -gt 0) {
+    Write-Event 'Named-profile or Startup-folder gateway state is present and cannot be restored safely from LOCAL SYSTEM.'
+    Add-ReportSection 'Safety abort'
+    Add-ReportLine 'Remove or migrate named-profile/Startup gateway backends before enabling fleet self-update.'
+    Save-Report
+    exit 7
+}
+
+$namedProfileGatewayTasks = @(
+    $gatewayScheduledTasks | Where-Object {
+        $_.TaskName -ne $GatewayScheduledTaskName
+    }
+)
+
+if ($namedProfileGatewayTasks.Count -gt 0) {
+    Write-Event 'Named-profile Hermes gateway tasks are present; per-profile state restoration is not supported safely.'
+    Add-ReportSection 'Safety abort'
+    Add-ReportLine ('Unsupported named-profile task(s): ' + (($namedProfileGatewayTasks | ForEach-Object {
+        "$($_.TaskPath)$($_.TaskName)"
+    }) -join ', '))
+    Add-ReportLine 'No gateway process was stopped and Hermes was not updated.'
+    Save-Report
+    exit 7
+}
+
+if ($runningGatewayServices.Count -gt 0) {
+    # A running Windows service is authoritative even if the Hermes CLI status
+    # command was unavailable. A merely installed but stopped service is not:
+    # a manually started gateway might still exist alongside it.
+    $gatewayStateKnown = $true
+}
+
+if (-not $gatewayStateKnown) {
+    Write-Event 'Gateway state is unknown and no running gateway service could establish it; refusing to update Hermes.'
+    Add-ReportSection 'Safety abort'
+    Add-ReportLine 'The pre-update gateway state could not be established reliably.'
+    Add-ReportLine 'No services or processes were stopped and Hermes was not updated.'
+    Save-Report
+    exit 7
+}
+
+if ($gatewayWasRunning -and $runningGatewayServices.Count -eq 0) {
+    if ($gatewayScheduledTasks.Count -ne 1) {
+        Write-Event "A running gateway requires exactly one supported Scheduled Task backend; found $($gatewayScheduledTasks.Count)."
+        Add-ReportSection 'Safety abort'
+        Add-ReportLine 'Expected exactly one official Hermes_Gateway Scheduled Task for the running gateway.'
+        Save-Report
+        exit 7
+    }
+
+    try {
+        Assert-OfficialHermesGatewayScheduledTask -Task $gatewayScheduledTasks[0]
+        $capturedGatewayScheduledTasks = @($gatewayScheduledTasks[0])
+    }
+    catch {
+        Write-Event "Gateway Scheduled Task validation failed: $($_.Exception.Message)"
+        Add-ReportSection 'Safety abort'
+        Add-ReportLine $_.Exception.Message
+        Save-Report
+        exit 7
+    }
+}
+
+if ($gatewayWasRunning -and
+    $runningGatewayServices.Count -eq 0 -and
+    $capturedGatewayScheduledTasks.Count -eq 0) {
+    Write-Event 'A running gateway has no supported service or Scheduled Task backend; refusing to restart it as LOCAL SYSTEM.'
+    Add-ReportSection 'Safety abort'
+    Add-ReportLine 'Register the gateway as a Windows service or the official Hermes_Gateway Scheduled Task, then rerun.'
+    Save-Report
+    exit 7
+}
+
+if ($runningGatewayServices.Count -gt 0) {
     $restartMode = 'service'
 }
-elseif ($gatewayWasRunning) {
-    $restartMode = 'manual'
+elseif ($capturedGatewayScheduledTasks.Count -gt 0) {
+    $restartMode = 'scheduled-task'
 }
 else {
     $restartMode = 'none'
@@ -1315,10 +1491,21 @@ else {
 Write-Event "Gateway restart mode after update: $restartMode"
 
 if ($gatewayServices.Count -gt 0) {
-    Write-Event ('Detected gateway service(s): ' + (($gatewayServices | ForEach-Object { $_.Name }) -join ', '))
+    Write-Event ('Detected gateway service(s): ' + (($gatewayServices | ForEach-Object {
+        "$($_.Name) [$($_.Status)]"
+    }) -join ', '))
 }
 else {
-    Write-Event 'No gateway service detected - manual gateway restart will be used if the gateway was running before update.'
+    Write-Event 'No gateway service detected.'
+}
+
+if ($gatewayScheduledTasks.Count -gt 0) {
+    Write-Event ('Detected gateway Scheduled Task(s): ' + (($gatewayScheduledTasks | ForEach-Object {
+        "$($_.TaskPath)$($_.TaskName) [$($_.State)]"
+    }) -join ', '))
+}
+else {
+    Write-Event 'No gateway Scheduled Task detected.'
 }
 
 if ($DryRun) {
@@ -1326,15 +1513,15 @@ if ($DryRun) {
 
     Add-ReportSection 'DryRun summary'
     Add-ReportLine "Would stop gateway via: hermes gateway stop --all"
-    Add-ReportLine "Would stop detected service(s): $((@($gatewayServices | ForEach-Object { $_.Name }) -join ', '))"
+    Add-ReportLine "Would stop running service(s): $((@($runningGatewayServices | ForEach-Object { $_.Name }) -join ', '))"
     Add-ReportLine "Would kill Hermes processes under: $HermesHome"
     Add-ReportLine "Would run: hermes update --yes --backup --force"
 
     if ($restartMode -eq 'service') {
-        Add-ReportLine 'Would restart detected gateway service(s).'
+        Add-ReportLine 'Would restart only gateway service(s) that are currently running.'
     }
-    elseif ($restartMode -eq 'manual') {
-        Add-ReportLine 'Would restart gateway manually with: hermes gateway run'
+    elseif ($restartMode -eq 'scheduled-task') {
+        Add-ReportLine 'Would restart the captured official Hermes_Gateway Scheduled Task under its registered user.'
     }
     else {
         Add-ReportLine 'Gateway was not running - would leave it stopped.'
@@ -1344,8 +1531,14 @@ if ($DryRun) {
     exit 0
 }
 
+$gatewayRestorationRequired = $restartMode -in @('service', 'scheduled-task')
+$restartExitCode = 0
+$restartResult = $null
+
+try {
 # Stop gateway via Hermes CLI first
 $gatewayStopResult = $null
+$stopPhaseSucceeded = $true
 
 try {
     $gatewayStopResult = Invoke-HermesCommand `
@@ -1357,6 +1550,11 @@ try {
 
     Write-Event "Gateway stop exit=$($gatewayStopResult.ExitCode)"
 
+    if ($gatewayStopResult.ExitCode -ne 0) {
+        $stopPhaseSucceeded = $false
+        Write-Event 'Graceful gateway stop failed; the update will not proceed.'
+    }
+
     if ($gatewayStopResult.StdOut) {
         Add-ReportBlock -Title 'Gateway stop - stdout' -Text $gatewayStopResult.StdOut
     }
@@ -1366,12 +1564,14 @@ try {
     }
 }
 catch {
+    $stopPhaseSucceeded = $false
     Write-Event "Gateway stop command failed: $($_.Exception.Message)"
 }
 
-# Stop gateway services if detected
-if ($gatewayServices.Count -gt 0) {
-    foreach ($svc in $gatewayServices) {
+# Stop only gateway services that were running before the update. Services
+# that were intentionally stopped must remain stopped.
+if ($runningGatewayServices.Count -gt 0) {
+    foreach ($svc in $runningGatewayServices) {
         try {
             Write-Event "Stopping service $($svc.Name)"
             Stop-Service -Name $svc.Name -Force -ErrorAction Stop
@@ -1384,7 +1584,15 @@ if ($gatewayServices.Count -gt 0) {
 }
 
 # Kill lingering Hermes-owned processes
-$killedProcesses = @(Stop-HermesProcesses)
+$killedProcesses = @()
+
+try {
+    $killedProcesses = @(Stop-HermesProcesses)
+}
+catch {
+    $stopPhaseSucceeded = $false
+    Write-Event "Hermes process termination failed: $($_.Exception.Message)"
+}
 
 Add-ReportSection 'Killed processes'
 
@@ -1397,62 +1605,140 @@ else {
     Add-ReportLine 'None found.'
 }
 
-# Run update
-$updateResult = $null
-$updateExitCode = 0
+$servicesNotStopped = @()
+
+foreach ($svc in $runningGatewayServices) {
+    $currentService = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
+
+    if (-not $currentService) {
+        $servicesNotStopped += $svc
+    }
+    elseif ($currentService.Status.ToString() -ne 'Stopped') {
+        $servicesNotStopped += $currentService
+    }
+}
+
+
+if ($servicesNotStopped.Count -gt 0) {
+    $stopPhaseSucceeded = $false
+    $serviceDetails = ($servicesNotStopped | ForEach-Object {
+        "$($_.Name) [$($_.Status)]"
+    }) -join ', '
+    Write-Event "Gateway service(s) still active after stop phase: $serviceDetails"
+}
+
+$remainingHermesProcesses = @()
 
 try {
-    Write-Event 'Starting hermes update --yes --backup --force'
-
-    $updateResult = Invoke-HermesCommand `
-        -Label 'update' `
-        -Arguments @('update', '--yes', '--backup', '--force') `
-        -TimeoutMinutes $UpdateTimeoutMinutes
-
-    $updateExitCode = $updateResult.ExitCode
-
-    if ($null -eq $updateExitCode) {
-        $updateExitCode = 1
-        Write-Log 'Hermes update returned no exit code; treating the update as failed.'
-    }
-
-    Set-Content -Path $UpdateOut -Value $updateResult.StdOut -Encoding UTF8
-    Set-Content -Path $UpdateErr -Value $updateResult.StdErr -Encoding UTF8
-
-    Write-Event "Update exit=$updateExitCode"
-
-    if ($updateResult.StdOut) {
-        Add-ReportBlock -Title 'Update - stdout' -Text $updateResult.StdOut
-    }
-
-    if ($updateResult.StdErr) {
-        Add-ReportBlock -Title 'Update - stderr' -Text $updateResult.StdErr
-    }
+    $processChain = @(Get-ProcessChain)
+    $protectedPids = @($PID) + @($processChain | ForEach-Object { $_.ProcessId })
+    $remainingHermesProcesses = @(
+        Get-HermesProcesses -ExcludePids $protectedPids
+    )
 }
 catch {
-    $updateExitCode = 1
-    Write-Log "Update exception: $($_.Exception.Message)"
-
-    Add-ReportSection 'Update exception'
-    Add-ReportLine $_.Exception.Message
+    $stopPhaseSucceeded = $false
+    Write-Event "Could not verify remaining Hermes processes: $($_.Exception.Message)"
 }
 
-if ($updateExitCode -eq 0 -and -not (Test-Path $HermesExe)) {
-    $updateExitCode = 5
-    Write-Event "Update completed, but the Hermes launcher is still missing: $HermesExe"
+if ($remainingHermesProcesses.Count -gt 0) {
+    $stopPhaseSucceeded = $false
+    $processDetails = ($remainingHermesProcesses | ForEach-Object {
+        "PID=$($_.ProcessId) Name=$($_.Name)"
+    }) -join ', '
+    Write-Event "Hermes process(es) still active after stop phase: $processDetails"
 }
-elseif (Test-Path $HermesExe) {
-    Write-Event "Hermes launcher verified: $HermesExe"
+
+# Run update
+$updateResult = $null
+$updateExitCode = if ($stopPhaseSucceeded) { 0 } else { 8 }
+
+if ($stopPhaseSucceeded) {
+    try {
+        Write-Event 'Starting hermes update --yes --backup --force'
+
+        $updateResult = Invoke-HermesCommand `
+            -Label 'update' `
+            -Arguments @('update', '--yes', '--backup', '--force') `
+            -TimeoutMinutes $UpdateTimeoutMinutes
+
+        $updateExitCode = $updateResult.ExitCode
+
+        if ($null -eq $updateExitCode) {
+            $updateExitCode = 1
+            Write-Log 'Hermes update returned no exit code; treating the update as failed.'
+        }
+
+        Set-Content -Path $UpdateOut -Value $updateResult.StdOut -Encoding UTF8
+        Set-Content -Path $UpdateErr -Value $updateResult.StdErr -Encoding UTF8
+
+        Write-Event "Update exit=$updateExitCode"
+
+        if ($updateResult.StdOut) {
+            Add-ReportBlock -Title 'Update - stdout' -Text $updateResult.StdOut
+        }
+
+        if ($updateResult.StdErr) {
+            Add-ReportBlock -Title 'Update - stderr' -Text $updateResult.StdErr
+        }
+    }
+    catch {
+        $updateExitCode = 1
+        Write-Log "Update exception: $($_.Exception.Message)"
+
+        Add-ReportSection 'Update exception'
+        Add-ReportLine $_.Exception.Message
+    }
+}
+else {
+    Write-Event 'Hermes update was skipped because the stop phase could not be verified.'
+    Add-ReportSection 'Update skipped'
+    Add-ReportLine 'Exit code 8: gateway services or Hermes processes remained active, or verification failed.'
+}
+
+$HermesVersionAfter = 'unknown'
+
+if ($updateExitCode -eq 0) {
+    if (-not (Test-Path -LiteralPath $HermesExe -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $HermesPython -PathType Leaf)) {
+        $updateExitCode = 5
+        Write-Event 'Update completed, but required Hermes executables are missing.'
+    }
+    else {
+        try {
+            $versionAfterResult = Invoke-HermesCommand `
+                -Label 'version-after' `
+                -Arguments @('--version') `
+                -TimeoutMinutes 2
+
+            if ($versionAfterResult.ExitCode -ne 0 -or
+                [string]::IsNullOrWhiteSpace($versionAfterResult.StdOut)) {
+                $updateExitCode = 5
+                Write-Event 'Post-update Hermes health check failed: --version returned no usable version.'
+            }
+            else {
+                $HermesVersionAfter = ($versionAfterResult.StdOut -split "`r?`n")[0].Trim()
+                Write-Event "Hermes executables and version verified: $HermesVersionAfter"
+            }
+        }
+        catch {
+            $updateExitCode = 5
+            Write-Event "Post-update Hermes health check failed: $($_.Exception.Message)"
+        }
+    }
 }
 
 # Restart gateway
-$restartExitCode = 0
-$restartResult = $null
-
-if ($restartMode -eq 'service') {
+if ($script:UnterminatedHermesCommand) {
+    $restartExitCode = 3
+    Add-ReportSection 'Gateway restart withheld'
+    Add-ReportLine 'A timed-out Hermes command could not be confirmed terminated; starting the gateway would be unsafe.'
+    Write-Log 'Normal gateway restart was withheld because an unterminated Hermes command may still be active.'
+}
+elseif ($restartMode -eq 'service') {
     Add-ReportSection 'Gateway restart'
 
-    foreach ($svc in $gatewayServices) {
+    foreach ($svc in $runningGatewayServices) {
         try {
             Write-Event "Starting service $($svc.Name)"
             Start-Service -Name $svc.Name -ErrorAction Stop
@@ -1465,6 +1751,16 @@ if ($restartMode -eq 'service') {
         }
     }
 
+    foreach ($svc in $runningGatewayServices) {
+        $currentService = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
+
+        if (-not $currentService -or
+            $currentService.Status.ToString() -ne 'Running') {
+            Write-Event "Service state was not restored to RUNNING: $($svc.Name)"
+            $restartExitCode = 3
+        }
+    }
+
     try {
         Start-Sleep -Seconds 5
 
@@ -1472,70 +1768,13 @@ if ($restartMode -eq 'service') {
             -Label 'gateway-status-after' `
             -Arguments @('gateway', 'status', '--full')
 
-        $gatewayStatusAfterText = $restartResult.StdOut
+        $serviceStatusText = "$($restartResult.StdOut)`r`n$($restartResult.StdErr)"
 
-        if ($restartResult.StdErr) {
-            $gatewayStatusAfterText = $gatewayStatusAfterText + "`r`n" + $restartResult.StdErr
+        if ($restartResult.ExitCode -ne 0 -or
+            -not (Test-GatewayStatusIndicatesRunning -Text $serviceStatusText)) {
+            $restartExitCode = 3
+            Write-Event 'Gateway status did not confirm a running service gateway.'
         }
-
-        Set-Content `
-            -Path $GatewayStatusAfterFile `
-            -Value $gatewayStatusAfterText `
-            -Encoding UTF8
-
-        if ($restartResult.StdOut) {
-            Add-ReportBlock -Title 'Gateway status after restart - stdout' -Text $restartResult.StdOut
-        }
-
-        if ($restartResult.StdErr) {
-            Add-ReportBlock -Title 'Gateway status after restart - stderr' -Text $restartResult.StdErr
-        }
-    }
-    catch {
-        Write-Log "Gateway status check after service restart failed: $($_.Exception.Message)"
-        Add-ReportLine "Gateway status check after service restart failed: $($_.Exception.Message)"
-    }
-}
-elseif ($restartMode -eq 'manual') {
-    Add-ReportSection 'Gateway restart'
-
-    try {
-        Write-Event 'Starting gateway manually with hermes gateway run'
-
-        if (Test-Path $GatewayStartOut) {
-            Remove-Item -Force $GatewayStartOut
-        }
-
-        if (Test-Path $GatewayStartErr) {
-            Remove-Item -Force $GatewayStartErr
-        }
-
-        $startProc = Start-Process `
-            -FilePath $HermesPython `
-            -WorkingDirectory $HermesRepo `
-            -ArgumentList (ConvertTo-CommandLine -Arguments @('-m', $HermesModule, 'gateway', 'run')) `
-            -WindowStyle Hidden `
-            -PassThru `
-            -RedirectStandardOutput $GatewayStartOut `
-            -RedirectStandardError $GatewayStartErr
-
-        $restartExitCode = 0
-
-        Add-ReportLine "Manual gateway start PID=$($startProc.Id)"
-
-        Start-Sleep -Seconds $GatewayStartWaitSeconds
-
-        if (Test-Path $GatewayStartOut) {
-            Add-ReportBlock -Title 'Gateway manual start - stdout' -Text (Get-Content -Raw -Encoding UTF8 $GatewayStartOut)
-        }
-
-        if (Test-Path $GatewayStartErr) {
-            Add-ReportBlock -Title 'Gateway manual start - stderr' -Text (Get-Content -Raw -Encoding UTF8 $GatewayStartErr)
-        }
-
-        $restartResult = Invoke-HermesCommand `
-            -Label 'gateway-status-after' `
-            -Arguments @('gateway', 'status', '--full')
 
         $gatewayStatusAfterText = $restartResult.StdOut
 
@@ -1558,8 +1797,67 @@ elseif ($restartMode -eq 'manual') {
     }
     catch {
         $restartExitCode = 3
-        Write-Log "Manual gateway restart failed: $($_.Exception.Message)"
-        Add-ReportLine $_.Exception.Message
+        Write-Log "Gateway status check after service restart failed: $($_.Exception.Message)"
+        Add-ReportLine "Gateway status check after service restart failed: $($_.Exception.Message)"
+    }
+}
+elseif ($restartMode -eq 'scheduled-task') {
+    Add-ReportSection 'Gateway restart'
+
+    foreach ($task in $capturedGatewayScheduledTasks) {
+        try {
+            Write-Event "Starting Scheduled Task $($task.TaskPath)$($task.TaskName)"
+            Start-ScheduledTask `
+                -TaskPath $task.TaskPath `
+                -TaskName $task.TaskName `
+                -ErrorAction Stop
+            Add-ReportLine "Started Scheduled Task: $($task.TaskPath)$($task.TaskName)"
+        }
+        catch {
+            $restartExitCode = 3
+            Write-Log "Start-ScheduledTask failed for $($task.TaskPath)$($task.TaskName): $($_.Exception.Message)"
+            Add-ReportLine "Start-ScheduledTask failed for $($task.TaskPath)$($task.TaskName): $($_.Exception.Message)"
+        }
+    }
+
+    try {
+        Start-Sleep -Seconds $GatewayStartWaitSeconds
+
+        $restartResult = Invoke-HermesCommand `
+            -Label 'gateway-status-after' `
+            -Arguments @('gateway', 'status', '--full')
+
+        $taskStatusText = "$($restartResult.StdOut)`r`n$($restartResult.StdErr)"
+
+        if ($restartResult.ExitCode -ne 0 -or
+            -not (Test-GatewayStatusIndicatesRunning -Text $taskStatusText)) {
+            $restartExitCode = 3
+            Write-Event 'Gateway status did not confirm a running Scheduled Task gateway.'
+        }
+
+        $gatewayStatusAfterText = $restartResult.StdOut
+
+        if ($restartResult.StdErr) {
+            $gatewayStatusAfterText = $gatewayStatusAfterText + "`r`n" + $restartResult.StdErr
+        }
+
+        Set-Content `
+            -Path $GatewayStatusAfterFile `
+            -Value $gatewayStatusAfterText `
+            -Encoding UTF8
+
+        if ($restartResult.StdOut) {
+            Add-ReportBlock -Title 'Gateway status after restart - stdout' -Text $restartResult.StdOut
+        }
+
+        if ($restartResult.StdErr) {
+            Add-ReportBlock -Title 'Gateway status after restart - stderr' -Text $restartResult.StdErr
+        }
+    }
+    catch {
+        $restartExitCode = 3
+        Write-Log "Gateway Scheduled Task restart check failed: $($_.Exception.Message)"
+        Add-ReportLine "Gateway Scheduled Task restart check failed: $($_.Exception.Message)"
     }
 }
 else {
@@ -1570,6 +1868,14 @@ else {
         $restartResult = Invoke-HermesCommand `
             -Label 'gateway-status-after' `
             -Arguments @('gateway', 'status', '--full')
+
+        $stoppedStatusText = "$($restartResult.StdOut)`r`n$($restartResult.StdErr)"
+
+        if ($restartResult.ExitCode -ne 0 -or
+            (Get-GatewayStatusState -Text $stoppedStatusText) -ne 'Stopped') {
+            $restartExitCode = 3
+            Write-Event 'Gateway status did not confirm that the previously stopped gateway remained stopped.'
+        }
 
         $gatewayStatusAfterText = $restartResult.StdOut
 
@@ -1591,25 +1897,39 @@ else {
         }
     }
     catch {
+        $restartExitCode = 3
         Write-Log "Gateway status check after update failed: $($_.Exception.Message)"
         Add-ReportLine "Gateway status check after update failed: $($_.Exception.Message)"
     }
 }
 
-$HermesVersionAfter = 'unknown'
-
-try {
-    $versionAfterResult = Invoke-HermesCommand `
-        -Label 'version-after' `
-        -Arguments @('--version') `
-        -TimeoutMinutes 2
-
-    if ($versionAfterResult.StdOut) {
-        $HermesVersionAfter = ($versionAfterResult.StdOut -split "`r?`n")[0].Trim()
-    }
+if ($gatewayRestorationRequired -and $restartExitCode -eq 0) {
+    $gatewayRestorationRequired = $false
 }
-catch {
-    Write-Log "Could not determine Hermes version after update: $($_.Exception.Message)"
+}
+finally {
+    if ($gatewayRestorationRequired) {
+        if ($script:UnterminatedHermesCommand) {
+            $restartExitCode = 3
+            Write-Log 'Gateway restoration was withheld because a timed-out Hermes command could not be confirmed terminated.'
+            Add-ReportLine 'CRITICAL: gateway restoration was withheld because an unterminated Hermes command may still be active.'
+        }
+        else {
+            $restoredInFinally = Restore-HermesGatewayBackend `
+                -Mode $restartMode `
+                -Services $runningGatewayServices `
+                -ScheduledTasks $capturedGatewayScheduledTasks
+
+            if ($restoredInFinally) {
+                Write-Log 'Captured gateway backend was restored by the safety finally block.'
+                $gatewayRestorationRequired = $false
+            }
+            else {
+                $restartExitCode = 3
+                Write-Log 'Safety finally block could not restore every captured gateway backend.'
+            }
+        }
+    }
 }
 
 $HermesVersionAfterInfo = ConvertTo-HermesVersionInfo -VersionText $HermesVersionAfter
@@ -1680,10 +2000,23 @@ else {
     'not available'
 }
 
+$gatewayExpectedState = if ($restartMode -eq 'none') { 'Stopped' } else { 'Running' }
+$gatewayObservedState = if ($null -ne $restartResult) {
+    Get-GatewayStatusState -Text "$($restartResult.StdOut)`r`n$($restartResult.StdErr)"
+}
+else {
+    'Unknown'
+}
+$gatewayBackendDisplay = switch ($restartMode) {
+    'service' { 'Windows service' }
+    'scheduled-task' { 'official Hermes_Gateway Scheduled Task' }
+    default { 'intentionally stopped' }
+}
+
 $overallStatus = if ($updateExitCode -ne 0) {
     'FAILED'
 }
-elseif ($restartExitCode -ne 0 -or $gatewayServiceStatus -ne 'RUNNING') {
+elseif ($restartExitCode -ne 0) {
     'WARNING'
 }
 else {
@@ -1694,6 +2027,9 @@ else {
 Add-ReportSection 'Summary'
 Add-ReportLine "Update exit code: $updateExitCode"
 Add-ReportLine "Gateway restart mode: $restartMode"
+Add-ReportLine "Gateway backend: $gatewayBackendDisplay"
+Add-ReportLine "Gateway expected state: $gatewayExpectedState"
+Add-ReportLine "Gateway observed state: $gatewayObservedState"
 Add-ReportLine "Restart exit code: $restartExitCode"
 Add-ReportLine "Overall status: $overallStatus"
 Add-ReportLine "Start webhook exit code: $startWebhookExitCode"
@@ -1708,8 +2044,8 @@ Add-ReportLine "Backup size: $backupSize"
 Add-ReportLine "Installation size before: $(Format-ByteSize -Bytes $InstallSizeBeforeBytes)"
 Add-ReportLine "Installation size after: $(Format-ByteSize -Bytes $InstallSizeAfterBytes)"
 Add-ReportLine "Installation size delta: $(Format-ByteDelta -Bytes $InstallSizeDeltaBytes)"
-Add-ReportLine "$GatewayServiceName status after update: $gatewayServiceStatus"
-Add-ReportLine "$GatewayServiceName PID after update: $gatewayServicePidAfterText"
+Add-ReportLine "Legacy Windows service status after update: $gatewayServiceStatus"
+Add-ReportLine "Gateway PID after update: $gatewayServicePidAfterText"
 Add-ReportLine "Gateway status before file: $GatewayStatusBeforeFile"
 Add-ReportLine "Gateway status after file: $GatewayStatusAfterFile"
 Add-ReportLine "Update stdout file: $UpdateOut"
@@ -1732,7 +2068,8 @@ else {
 }
 
 $installationEmoji = if ($updateExitCode -eq 0) { $EmojiCheck } else { $EmojiCross }
-$gatewayEmoji = if ($gatewayServiceStatus -eq 'RUNNING') { $EmojiCheck } else { $EmojiWarning }
+$gatewayEmoji = if ($gatewayObservedState -eq $gatewayExpectedState -and
+    $restartExitCode -eq 0) { $EmojiCheck } else { $EmojiWarning }
 $statusCircle = if ($overallStatus -eq 'SUCCESS') {
     $EmojiGreenCircle
 }
@@ -1754,7 +2091,12 @@ else {
 }
 
 $finalDescription = if ($overallStatus -eq 'SUCCESS') {
-    'Hermes was updated successfully and the gateway service is running.'
+    if ($restartMode -eq 'none') {
+        'Hermes was updated successfully and the gateway remained intentionally stopped.'
+    }
+    else {
+        "Hermes was updated successfully and the gateway was restored through its $gatewayBackendDisplay."
+    }
 }
 elseif ($overallStatus -eq 'WARNING') {
     'The update completed, but the gateway or restart result requires attention.'
@@ -1795,8 +2137,8 @@ $finalEmbed = @{
             inline = $true
         },
         @{
-            name   = $GatewayServiceName
-            value  = "$gatewayEmoji $gatewayServiceStatus`nPID: $gatewayServicePidAfterText"
+            name   = 'Gateway backend'
+            value  = "$gatewayEmoji $gatewayBackendDisplay`nExpected: $gatewayExpectedState | Observed: $gatewayObservedState`nPID: $gatewayServicePidAfterText"
             inline = $true
         },
         @{
@@ -1914,18 +2256,7 @@ catch {
 
 Save-Report
 
-Write-Event '=== weekly update run finished ==='
-
-# Cleanup one-shot task after execution
-if ($FromScheduledTask) {
-    try {
-        Unregister-ScheduledTask -TaskName $ScheduledTaskName -Confirm:$false -ErrorAction SilentlyContinue
-        Write-Log "Removed scheduled task: $ScheduledTaskName"
-    }
-    catch {
-        Write-Log "Could not remove scheduled task ${ScheduledTaskName}: $($_.Exception.Message)"
-    }
-}
+Write-Event '=== self-update run finished ==='
 
 $finalExitCode = $updateExitCode
 
@@ -1933,8 +2264,8 @@ if ($restartExitCode -ne 0 -and $finalExitCode -eq 0) {
     $finalExitCode = $restartExitCode
 }
 
-if ($webhookExitCode -ne 0 -and $finalExitCode -eq 0) {
-    $finalExitCode = $webhookExitCode
+if ($webhookExitCode -ne 0) {
+    Write-Log "Notification failed with exit $webhookExitCode; maintenance exit remains $finalExitCode."
 }
 
 exit $finalExitCode

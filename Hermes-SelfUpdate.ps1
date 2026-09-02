@@ -40,7 +40,8 @@ if ([string]::IsNullOrWhiteSpace($WebhookUrl)) {
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\scripts\Hermes-SelfUpdate.ps1" -DryRun
 #
 # Destructive mode:
-#   Only allowed through the installed SYSTEM supervisor with -FromScheduledTask
+#   Only allowed through the installed least-privileged supervisor with
+#   -FromScheduledTask
 # ============================================================
 
 $HermesUserProfile = [IO.Path]::GetFullPath(
@@ -59,9 +60,75 @@ $HermesExe = Join-Path $HermesRepo 'venv\Scripts\hermes.exe'
 $HermesPython = Join-Path $HermesRepo 'venv\Scripts\python.exe'
 $HermesModule = 'hermes_cli.main'
 
+function Get-HermesProfileUserSid {
+    param([Parameter(Mandatory = $true)][string]$ProfilePath)
+
+    $normalizedProfile = [IO.Path]::GetFullPath($ProfilePath).TrimEnd('\')
+
+    try {
+        foreach ($profileKey in @(Get-ChildItem -LiteralPath (
+                    'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+                ) -ErrorAction Stop)) {
+            $profileImagePath = (Get-ItemProperty `
+                    -LiteralPath $profileKey.PSPath `
+                    -Name ProfileImagePath `
+                    -ErrorAction Stop).ProfileImagePath
+
+            if ([string]::IsNullOrWhiteSpace($profileImagePath)) {
+                continue
+            }
+
+            $candidateProfile = [IO.Path]::GetFullPath(
+                [Environment]::ExpandEnvironmentVariables($profileImagePath)
+            ).TrimEnd('\')
+
+            if ($candidateProfile.Equals($normalizedProfile, [StringComparison]::OrdinalIgnoreCase) -and
+                $profileKey.PSChildName -match '^S-1-5-21-') {
+                return $profileKey.PSChildName
+            }
+        }
+    }
+    catch {
+        # Continue with ACL/account resolution.
+    }
+
+    try {
+        $ownerSid = (Get-Acl -LiteralPath $normalizedProfile -ErrorAction Stop).GetOwner(
+            [Security.Principal.SecurityIdentifier]
+        ).Value
+
+        if ($ownerSid -match '^S-1-5-21-') {
+            return $ownerSid
+        }
+    }
+    catch {
+        # Continue with the conventional local-account fallback.
+    }
+
+    $profileUser = Split-Path -Leaf $normalizedProfile
+    return (New-Object Security.Principal.NTAccount(
+            $env:COMPUTERNAME,
+            $profileUser
+        )).Translate([Security.Principal.SecurityIdentifier]).Value
+}
+
+function ConvertTo-SidString {
+    param([Parameter(Mandatory = $true)][string]$Identity)
+
+    if ($Identity -match '^S-1-') {
+        return (New-Object Security.Principal.SecurityIdentifier($Identity)).Value
+    }
+
+    return (New-Object Security.Principal.NTAccount($Identity)).Translate(
+        [Security.Principal.SecurityIdentifier]
+    ).Value
+}
+
+$HermesProfileUserSid = Get-HermesProfileUserSid -ProfilePath $HermesUserProfile
+
 function Initialize-HermesTaskEnvironment {
-    # Scheduled tasks run as SYSTEM. Point Hermes and its child processes at
-    # the Administrator installation and profile explicitly.
+    # S4U tasks do not load a complete interactive profile environment. Point
+    # Hermes and its child processes at the configured profile explicitly.
     $env:USERPROFILE = $HermesUserProfile
     $env:HOME = $HermesUserProfile
     $env:HOMEDRIVE = [IO.Path]::GetPathRoot($HermesUserProfile).TrimEnd('\')
@@ -265,6 +332,37 @@ function Test-GatewayStatusIndicatesRunning {
     return (Get-GatewayStatusState -Text $Text) -eq 'Running'
 }
 
+function Get-GatewayProcessIdsFromStatus {
+    param(
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return @()
+    }
+
+    $processIds = New-Object System.Collections.Generic.List[int]
+    $runningLines = [regex]::Matches(
+        $Text,
+        '(?im)^\s*[^\p{L}\p{N}\r\n]*\s*Gateway(?:\s+process)?\s+(?:(?:is|status:)\s+)?running\b[^\r\n]*\bPID\s*:\s*([0-9][0-9,\s]*)'
+    )
+
+    foreach ($runningLine in $runningLines) {
+        foreach ($rawProcessId in @($runningLine.Groups[1].Value -split ',')) {
+            $parsedProcessId = 0
+
+            if ([int]::TryParse($rawProcessId.Trim(), [ref]$parsedProcessId) -and
+                $parsedProcessId -gt 0 -and
+                -not $processIds.Contains($parsedProcessId)) {
+                [void]$processIds.Add($parsedProcessId)
+            }
+        }
+    }
+
+    return $processIds.ToArray()
+}
+
 function Get-ServiceProcessId {
     param([string]$ServiceName)
 
@@ -429,9 +527,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$ScriptPath" -ScheduleO
 
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 
-    if (-not $identity.User -or $identity.User.Value -ne 'S-1-5-18') {
+    if (-not $identity.User -or
+        $identity.User.Value -eq 'S-1-5-18' -or
+        $identity.User.Value -ne $HermesProfileUserSid) {
         throw @"
-Refusing destructive execution outside the installed LOCAL SYSTEM supervisor.
+Refusing destructive execution outside the installed Hermes profile task.
 
 Do not invoke -FromScheduledTask manually. Use:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$ScriptPath" -ScheduleOnly
@@ -505,8 +605,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\scripts\Install-Herm
 "@
     }
 
-    if ($task.Principal.UserId -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')) {
-        throw "Refusing to start task '$ScheduledTaskName' because its principal is not LOCAL SYSTEM."
+    $taskPrincipalSid = ConvertTo-SidString $task.Principal.UserId
+
+    if ($taskPrincipalSid -ne $HermesProfileUserSid -or
+        $taskPrincipalSid -eq 'S-1-5-18' -or
+        $task.Principal.LogonType.ToString() -ne 'S4U' -or
+        $task.Principal.RunLevel.ToString() -ne 'Limited') {
+        throw "Refusing to start task '$ScheduledTaskName' because its principal is not the configured S4U/Limited Hermes profile user."
     }
 
     if ($task.State.ToString() -eq 'Disabled' -or
@@ -536,6 +641,29 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\scripts\Install-Herm
     Write-Output 'Hermes self-update task started.'
     Write-Output "Task: $ScheduledTaskName"
     Write-Output 'The supervisor will refresh the repository before running the update.'
+}
+
+function Test-IsHermesGatewayProcessShape {
+    param([object]$Process)
+
+    if (-not $Process -or
+        $Process.Name -notmatch '^(?:hermes|python|pythonw)\.exe$' -or
+        [string]::IsNullOrWhiteSpace($Process.CommandLine)) {
+        return $false
+    }
+
+    $moduleShape = '(?i)(?:^|\s)-m\s+hermes_cli(?:\.main)?(?=\s|$).*?(?:^|\s)gateway\s+run(?=\s|$)'
+    $launcherShape = '(?i)(?:^|\s)(?:"[^"]*[\\/])?hermes(?:\.exe)?"?(?=\s|$).*?(?:^|\s)gateway\s+run(?=\s|$)'
+
+    return ($Process.CommandLine -match $moduleShape -or
+        $Process.CommandLine -match $launcherShape)
+}
+
+function Get-HermesGatewayProcesses {
+    return @(
+        Get-CimInstance Win32_Process -ErrorAction Stop |
+            Where-Object { Test-IsHermesGatewayProcessShape -Process $_ }
+    )
 }
 
 function Invoke-HermesCommand {
@@ -697,13 +825,46 @@ function Get-HermesProcesses {
 }
 
 function Stop-HermesProcesses {
+    param([object[]]$TargetProcesses = @())
+
     $killed = New-Object System.Collections.Generic.List[string]
+
+    if ($TargetProcesses.Count -eq 0) {
+        return $killed.ToArray()
+    }
 
     $processChain = @(Get-ProcessChain)
     $protectedPids = @($PID) + @($processChain | ForEach-Object { $_.ProcessId })
 
     for ($pass = 1; $pass -le 2; $pass++) {
-        $targets = @(Get-HermesProcesses -ExcludePids $protectedPids)
+        $targets = New-Object System.Collections.Generic.List[object]
+
+        foreach ($capturedProcess in $TargetProcesses) {
+            $capturedProcessId = [int]$capturedProcess.ProcessId
+
+            if ($capturedProcessId -in $protectedPids) {
+                throw "Refusing to terminate protected updater process PID $capturedProcessId."
+            }
+
+            $currentProcess = Get-CimInstance `
+                -ClassName Win32_Process `
+                -Filter "ProcessId=$capturedProcessId" `
+                -ErrorAction SilentlyContinue
+
+            if (-not $currentProcess) {
+                continue
+            }
+
+            if ([string]$currentProcess.CreationDate -ne [string]$capturedProcess.CreationDate) {
+                throw "Refusing reused gateway PID $capturedProcessId; its creation time changed."
+            }
+
+            if (-not (Test-IsHermesGatewayProcessShape -Process $currentProcess)) {
+                throw "Refusing PID $capturedProcessId because it no longer has the Hermes gateway command shape."
+            }
+
+            [void]$targets.Add($currentProcess)
+        }
 
         if ($targets.Count -eq 0) {
             break
@@ -737,6 +898,19 @@ function Stop-HermesProcesses {
         }
 
         Start-Sleep -Seconds 2
+    }
+
+    foreach ($capturedProcess in $TargetProcesses) {
+        $capturedProcessId = [int]$capturedProcess.ProcessId
+        $remainingProcess = Get-CimInstance `
+            -ClassName Win32_Process `
+            -Filter "ProcessId=$capturedProcessId" `
+            -ErrorAction SilentlyContinue
+
+        if ($remainingProcess -and
+            [string]$remainingProcess.CreationDate -eq [string]$capturedProcess.CreationDate) {
+            throw "Gateway process PID $capturedProcessId is still running after termination attempts."
+        }
     }
 
     return $killed.ToArray()
@@ -1097,7 +1271,7 @@ if ($repairRequired) {
     }
     else {
         $repairStatusText = 'REQUIRED - automatic repair disabled'
-        Write-Event 'Automatic SYSTEM repair is disabled; update aborted before gateway mutation.'
+        Write-Event 'Automatic repair is disabled; update aborted before gateway mutation.'
         Add-ReportSection 'Manual repair required'
         Add-ReportLine ($repairReasons -join '; ')
         Add-ReportLine 'Repair Hermes explicitly, verify the installation, then rerun the scheduled task.'
@@ -1178,7 +1352,7 @@ else {
 }
 
 $runMode = if ($FromScheduledTask) {
-    'Windows Task Scheduler (SYSTEM)'
+    'Windows Task Scheduler (Hermes profile / S4U / Limited)'
 }
 elseif ($DryRun) {
     'Direct dry run'
@@ -1299,6 +1473,8 @@ $capturedGatewayScheduledTasks = @()
 $gatewayWasRunning = $false
 $gatewayStateKnown = $false
 $gatewayStatusState = 'Unknown'
+$capturedGatewayPids = @()
+$capturedGatewayProcesses = @()
 $restartMode = 'none'
 
 try {
@@ -1330,6 +1506,9 @@ try {
     if ($gatewayStatusBefore.ExitCode -eq 0) {
         $gatewayStatusCombined = "$($gatewayStatusBefore.StdOut)`r`n$($gatewayStatusBefore.StdErr)"
         $gatewayStatusState = Get-GatewayStatusState -Text $gatewayStatusCombined
+        $capturedGatewayPids = @(
+            Get-GatewayProcessIdsFromStatus -Text $gatewayStatusCombined
+        )
 
         if ($gatewayStatusState -eq 'Unknown') {
             Write-Event 'Gateway status output did not contain a recognized running/stopped state.'
@@ -1351,6 +1530,46 @@ if ($script:UnterminatedHermesCommand) {
     Write-Event 'Gateway status command could not be terminated; refusing all gateway and update mutations.'
     Add-ReportSection 'Safety abort'
     Add-ReportLine 'A timed-out preflight command may still be active.'
+    Save-Report
+    exit 7
+}
+
+try {
+    $gatewayProcessInventory = @(Get-HermesGatewayProcesses)
+}
+catch {
+    Write-Event "Gateway process inventory failed: $($_.Exception.Message)"
+    Add-ReportSection 'Safety abort'
+    Add-ReportLine 'The running gateway process inventory could not be established.'
+    Save-Report
+    exit 7
+}
+
+if ($gatewayStatusState -eq 'Running') {
+    $inventoryPids = @($gatewayProcessInventory | ForEach-Object { [int]$_.ProcessId })
+    $missingStatusPids = @($capturedGatewayPids | Where-Object { $_ -notin $inventoryPids })
+    $uncapturedGatewayPids = @($inventoryPids | Where-Object { $_ -notin $capturedGatewayPids })
+
+    if ($capturedGatewayPids.Count -eq 0 -or
+        $missingStatusPids.Count -gt 0 -or
+        $uncapturedGatewayPids.Count -gt 0) {
+        Write-Event 'Gateway status PIDs and the machine process inventory do not match; refusing to mutate Hermes.'
+        Add-ReportSection 'Safety abort'
+        Add-ReportLine 'A running gateway must expose every PID and every PID must have the exact Hermes gateway command shape.'
+        Save-Report
+        exit 7
+    }
+
+    $capturedGatewayProcesses = @(
+        $gatewayProcessInventory | Where-Object {
+            [int]$_.ProcessId -in $capturedGatewayPids
+        }
+    )
+}
+elseif ($gatewayStatusState -eq 'Stopped' -and $gatewayProcessInventory.Count -gt 0) {
+    Write-Event 'Hermes reports the default gateway stopped, but gateway-shaped processes still exist; refusing to mutate Hermes.'
+    Add-ReportSection 'Safety abort'
+    Add-ReportLine 'Stop or migrate all gateway profiles before retrying the self-update.'
     Save-Report
     exit 7
 }
@@ -1400,7 +1619,7 @@ if (Test-Path -LiteralPath $startupDirectory -PathType Container) {
 $profiledGatewayProcesses = @(
     Get-HermesProcesses | Where-Object {
         $_.CommandLine -and
-        $_.CommandLine -match '(?i)(?:^|\s)--profile(?:=|\s)'
+        $_.CommandLine -match '(?i)(?:^|\s)(?:--profile|-p)(?:=|\s)'
     }
 )
 
@@ -1512,7 +1731,7 @@ if ($DryRun) {
     Write-Event 'DryRun requested - no changes were made.'
 
     Add-ReportSection 'DryRun summary'
-    Add-ReportLine "Would stop gateway via: hermes gateway stop --all"
+    Add-ReportLine 'Would stop only the default gateway via: hermes gateway stop'
     Add-ReportLine "Would stop running service(s): $((@($runningGatewayServices | ForEach-Object { $_.Name }) -join ', '))"
     Add-ReportLine "Would kill Hermes processes under: $HermesHome"
     Add-ReportLine "Would run: hermes update --yes --backup --force"
@@ -1543,7 +1762,7 @@ $stopPhaseSucceeded = $true
 try {
     $gatewayStopResult = Invoke-HermesCommand `
         -Label 'gateway-stop' `
-        -Arguments @('gateway', 'stop', '--all')
+        -Arguments @('gateway', 'stop')
 
     Set-Content -Path $GatewayStopOut -Value $gatewayStopResult.StdOut -Encoding UTF8
     Set-Content -Path $GatewayStopErr -Value $gatewayStopResult.StdErr -Encoding UTF8
@@ -1587,7 +1806,9 @@ if ($runningGatewayServices.Count -gt 0) {
 $killedProcesses = @()
 
 try {
-    $killedProcesses = @(Stop-HermesProcesses)
+    $killedProcesses = @(
+        Stop-HermesProcesses -TargetPids $capturedGatewayPids
+    )
 }
 catch {
     $stopPhaseSucceeded = $false

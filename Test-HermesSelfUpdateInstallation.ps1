@@ -36,6 +36,7 @@ $script:LocalHead = $null
 $script:TaskEnabled = $null
 $script:TaskState = 'Unavailable'
 $script:NextRunTime = $null
+$script:HermesUserSid = $null
 
 function Add-Pass {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -99,6 +100,60 @@ function Test-PathsEqual {
     }
     catch {
         return $false
+    }
+}
+
+function Get-HermesProfileOwnerSid {
+    if (-not (Test-Path -LiteralPath $HermesUserProfile -PathType Container)) {
+        throw 'The configured Hermes user profile directory is missing.'
+    }
+
+    $profileItem = Get-Item -LiteralPath $HermesUserProfile -Force
+
+    if (($profileItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The configured Hermes user profile directory is a reparse point.'
+    }
+
+    $profileAcl = Get-Acl -LiteralPath $HermesUserProfile -ErrorAction Stop
+    $ownerSid = $profileAcl.GetOwner(
+        [Security.Principal.SecurityIdentifier]
+    ).Value
+
+    if ($ownerSid -eq 'S-1-5-18') {
+        throw 'The configured Hermes user profile is owned by LOCAL SYSTEM.'
+    }
+
+    if ($ownerSid -notmatch '^S-1-5-21-') {
+        throw 'The configured Hermes user profile owner is not a user SID.'
+    }
+
+    return $ownerSid
+}
+
+function Resolve-IdentitySid {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Identity
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Identity)) {
+        return $null
+    }
+
+    try {
+        if ($Identity -match '^S-\d-(?:\d+-){1,14}\d+$') {
+            return ([Security.Principal.SecurityIdentifier]$Identity).Value
+        }
+
+        $account = New-Object Security.Principal.NTAccount `
+            -ArgumentList $Identity
+        return $account.Translate(
+            [Security.Principal.SecurityIdentifier]
+        ).Value
+    }
+    catch {
+        return $null
     }
 }
 
@@ -200,7 +255,13 @@ function Test-SecureFileSystemPath {
 
     $systemSid = 'S-1-5-18'
     $administratorsSid = 'S-1-5-32-544'
+    $approvedOwnerSids = @($systemSid, $administratorsSid)
     $approvedWriterSids = @($systemSid, $administratorsSid)
+
+    if ($script:HermesUserSid) {
+        $approvedWriterSids += $script:HermesUserSid
+    }
+
     $hasSecurityFailure = $false
 
     if ($RequireProtectedDacl -and -not $acl.AreAccessRulesProtected) {
@@ -208,7 +269,7 @@ function Test-SecureFileSystemPath {
         $hasSecurityFailure = $true
     }
 
-    if ($ownerSid -notin $approvedWriterSids) {
+    if ($ownerSid -notin $approvedOwnerSids) {
         Add-Failure "$Label owner is neither SYSTEM nor BUILTIN\Administrators."
         $hasSecurityFailure = $true
     }
@@ -258,7 +319,7 @@ function Test-SecureFileSystemPath {
     }
 
     if ($unauthorizedWriterCount -gt 0) {
-        Add-Failure "$Label grants write-capable rights outside SYSTEM and BUILTIN\Administrators."
+        Add-Failure "$Label grants write-capable rights outside SYSTEM, BUILTIN\Administrators, and the configured Hermes profile owner."
         $hasSecurityFailure = $true
     }
 
@@ -272,8 +333,11 @@ function Test-SecureFileSystemPath {
             $identityLabel = if ($approvedSid -eq $systemSid) {
                 'SYSTEM'
             }
-            else {
+            elseif ($approvedSid -eq $administratorsSid) {
                 'BUILTIN\Administrators'
+            }
+            else {
+                'the configured Hermes profile owner'
             }
 
             Add-Failure "$Label does not grant effective FullControl to $identityLabel."
@@ -639,15 +703,22 @@ function Test-ScheduledTaskConfiguration {
     }
 
     try {
-        if ($task.Principal.UserId -in @(
-            'SYSTEM',
-            'NT AUTHORITY\SYSTEM',
-            'S-1-5-18'
-        )) {
-            Add-Pass 'The scheduled task runs as LOCAL SYSTEM.'
+        $taskPrincipalSid = Resolve-IdentitySid -Identity $task.Principal.UserId
+
+        if (-not $script:HermesUserSid) {
+            Add-Failure 'The scheduled task principal cannot be verified without the Hermes profile owner SID.'
+        }
+        elseif ($taskPrincipalSid -eq 'S-1-5-18') {
+            Add-Failure 'The scheduled task must not run as LOCAL SYSTEM.'
+        }
+        elseif ($taskPrincipalSid -eq $script:HermesUserSid) {
+            Add-Pass 'The scheduled task runs as the configured Hermes profile owner.'
+        }
+        elseif (-not $taskPrincipalSid) {
+            Add-Failure 'The scheduled task principal could not be resolved to a SID.'
         }
         else {
-            Add-Failure 'The scheduled task does not run as LOCAL SYSTEM.'
+            Add-Failure 'The scheduled task principal does not match the Hermes profile owner SID.'
         }
     }
     catch {
@@ -655,11 +726,11 @@ function Test-ScheduledTaskConfiguration {
     }
 
     try {
-        if ($task.Principal.RunLevel.ToString() -eq 'Highest') {
-            Add-Pass 'The scheduled task uses the Highest run level.'
+        if ($task.Principal.RunLevel.ToString() -eq 'Limited') {
+            Add-Pass 'The scheduled task uses the Limited run level.'
         }
         else {
-            Add-Failure 'The scheduled task does not use the Highest run level.'
+            Add-Failure 'The scheduled task does not use the Limited run level.'
         }
     }
     catch {
@@ -667,11 +738,11 @@ function Test-ScheduledTaskConfiguration {
     }
 
     try {
-        if ($task.Principal.LogonType.ToString() -eq 'ServiceAccount') {
-            Add-Pass 'The scheduled task uses the ServiceAccount logon type.'
+        if ($task.Principal.LogonType.ToString() -eq 'S4U') {
+            Add-Pass 'The scheduled task uses the S4U logon type.'
         }
         else {
-            Add-Failure 'The scheduled task does not use the ServiceAccount logon type.'
+            Add-Failure 'The scheduled task does not use the S4U logon type.'
         }
     }
     catch {
@@ -888,6 +959,15 @@ catch {
     Write-FinalSummary
     Write-Output 'RESULT: FAILED (1 failed check)'
     exit 1
+}
+
+try {
+    $script:HermesUserSid = Get-HermesProfileOwnerSid
+    Add-Pass "Hermes profile owner SID: $($script:HermesUserSid)"
+}
+catch {
+    $script:HermesUserSid = $null
+    Add-Failure 'The Hermes profile owner SID could not be established safely.'
 }
 
 $repositoryFiles = @(

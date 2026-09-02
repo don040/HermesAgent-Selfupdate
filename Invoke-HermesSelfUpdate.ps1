@@ -30,7 +30,6 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$SystemSid = 'S-1-5-18'
 $SupervisorFileName = 'Invoke-HermesSelfUpdate.ps1'
 $MainScriptFileName = 'Hermes-SelfUpdate.ps1'
 $script:LogFile = $null
@@ -41,6 +40,56 @@ function Get-NormalizedFullPath {
 
     $expanded = [Environment]::ExpandEnvironmentVariables($Path)
     return [IO.Path]::GetFullPath($expanded).TrimEnd('\')
+}
+
+function Get-HermesProfileUserSid {
+    param([Parameter(Mandatory = $true)][string]$ProfilePath)
+
+    $normalizedProfile = Get-NormalizedFullPath $ProfilePath
+
+    try {
+        foreach ($profileKey in @(Get-ChildItem -LiteralPath (
+                    'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+                ) -ErrorAction Stop)) {
+            $profileImagePath = (Get-ItemProperty `
+                    -LiteralPath $profileKey.PSPath `
+                    -Name ProfileImagePath `
+                    -ErrorAction Stop).ProfileImagePath
+
+            if ([string]::IsNullOrWhiteSpace($profileImagePath)) {
+                continue
+            }
+
+            if ((Get-NormalizedFullPath $profileImagePath).Equals(
+                    $normalizedProfile,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -and $profileKey.PSChildName -match '^S-1-5-21-') {
+                return $profileKey.PSChildName
+            }
+        }
+    }
+    catch {
+        # Continue with ACL/account resolution.
+    }
+
+    try {
+        $ownerSid = (Get-Acl -LiteralPath $normalizedProfile -ErrorAction Stop).GetOwner(
+            [Security.Principal.SecurityIdentifier]
+        ).Value
+
+        if ($ownerSid -match '^S-1-5-21-') {
+            return $ownerSid
+        }
+    }
+    catch {
+        # Continue with the conventional local-account fallback.
+    }
+
+    $profileUser = Split-Path -Leaf $normalizedProfile
+    return (New-Object Security.Principal.NTAccount(
+            $env:COMPUTERNAME,
+            $profileUser
+        )).Translate([Security.Principal.SecurityIdentifier]).Value
 }
 
 function Assert-SafeDirectoryPath {
@@ -413,6 +462,7 @@ $StatePath = Get-NormalizedFullPath $StatePath
 Assert-SafeDirectoryPath -Path $InstallPath -Label 'InstallPath'
 Assert-SafeDirectoryPath -Path $StatePath -Label 'StatePath'
 Assert-SafeDirectoryPath -Path $HermesUserProfile -Label 'HermesUserProfile'
+$expectedHermesUserSid = Get-HermesProfileUserSid -ProfilePath $HermesUserProfile
 
 if ($InstallPath.StartsWith($StatePath + '\', [StringComparison]::OrdinalIgnoreCase) -or
     $StatePath.StartsWith($InstallPath + '\', [StringComparison]::OrdinalIgnoreCase) -or
@@ -430,8 +480,10 @@ Assert-SafeDirectoryPath -Path $TemporaryPath -Label 'TemporaryPath'
 $script:LogFile = Join-Path $LogsPath 'supervisor.log'
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 
-    if (-not $identity.User -or $identity.User.Value -ne $SystemSid) {
-        throw 'The supervisor must run as LOCAL SYSTEM. Start the installed Scheduled Task instead of invoking this file directly.'
+    if (-not $identity.User -or
+        $identity.User.Value -eq 'S-1-5-18' -or
+        $identity.User.Value -ne $expectedHermesUserSid) {
+        throw 'The supervisor must run as the configured Hermes profile user. Start the installed Scheduled Task instead of invoking this file directly.'
     }
 
     $mutex = New-Object Threading.Mutex($false, 'Global\HermesAgentSelfUpdate')

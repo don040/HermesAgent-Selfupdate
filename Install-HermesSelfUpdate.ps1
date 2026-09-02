@@ -34,6 +34,7 @@ $SupervisorFileName = 'Invoke-HermesSelfUpdate.ps1'
 $MainScriptFileName = 'Hermes-SelfUpdate.ps1'
 $LegacyBackupPath = $null
 $script:GitExe = $null
+$script:HermesUserSid = $null
 
 function Get-NormalizedFullPath {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -384,11 +385,25 @@ function Set-SecureDirectoryAcl {
         }
     }
 
-    # Protected, exact DACLs: only LOCAL SYSTEM (SY) and the built-in local
-    # Administrators group (BA) retain access. This removes both inherited and
-    # pre-existing explicit ACEs from a pre-created/squatted directory.
-    $directorySddl = 'O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
-    $fileSddl = 'O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)'
+    # Protected, exact DACLs: LOCAL SYSTEM (SY), the built-in local
+    # Administrators group (BA), and the Hermes profile user retain access.
+    # This removes inherited and pre-existing explicit ACEs from a
+    # pre-created/squatted directory while allowing the least-privileged S4U
+    # task to refresh the checkout and write its state.
+    $userDirectoryAce = if ($script:HermesUserSid) {
+        "(A;OICI;FA;;;$($script:HermesUserSid))"
+    }
+    else {
+        ''
+    }
+    $userFileAce = if ($script:HermesUserSid) {
+        "(A;;FA;;;$($script:HermesUserSid))"
+    }
+    else {
+        ''
+    }
+    $directorySddl = 'O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)' + $userDirectoryAce
+    $fileSddl = 'O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)' + $userFileAce
 
     $rootSecurity = New-Object Security.AccessControl.DirectorySecurity
     $rootSecurity.SetSecurityDescriptorSddlForm($directorySddl)
@@ -406,6 +421,72 @@ function Set-SecureDirectoryAcl {
             [IO.File]::SetAccessControl($item.FullName, $security)
         }
     }
+}
+
+function Get-HermesProfileUserSid {
+    $normalizedProfile = Get-NormalizedFullPath $HermesUserProfile
+
+    try {
+        foreach ($profileKey in @(Get-ChildItem -LiteralPath (
+                    'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+                ) -ErrorAction Stop)) {
+            $profileImagePath = (Get-ItemProperty `
+                    -LiteralPath $profileKey.PSPath `
+                    -Name ProfileImagePath `
+                    -ErrorAction Stop).ProfileImagePath
+
+            if ([string]::IsNullOrWhiteSpace($profileImagePath)) {
+                continue
+            }
+
+            $candidateProfile = Get-NormalizedFullPath $profileImagePath
+
+            if ($candidateProfile.Equals($normalizedProfile, [StringComparison]::OrdinalIgnoreCase) -and
+                $profileKey.PSChildName -match '^S-1-5-21-') {
+                return $profileKey.PSChildName
+            }
+        }
+    }
+    catch {
+        # Continue with ACL/account resolution for hosts without a readable
+        # ProfileList registry key.
+    }
+
+    try {
+        $profileAcl = Get-Acl -LiteralPath $HermesUserProfile -ErrorAction Stop
+        $ownerSid = $profileAcl.GetOwner(
+            [Security.Principal.SecurityIdentifier]
+        ).Value
+
+        if ($ownerSid -notin @('S-1-5-18', 'S-1-5-32-544') -and
+            $ownerSid -match '^S-1-5-21-') {
+            return $ownerSid
+        }
+    }
+    catch {
+        # Fall back to resolving the profile directory name as a local user.
+    }
+
+    $profileUser = Split-Path -Leaf $HermesUserProfile
+    $account = New-Object Security.Principal.NTAccount(
+        $env:COMPUTERNAME,
+        $profileUser
+    )
+    return $account.Translate(
+        [Security.Principal.SecurityIdentifier]
+    ).Value
+}
+
+function ConvertTo-SidString {
+    param([Parameter(Mandatory = $true)][string]$Identity)
+
+    if ($Identity -match '^S-1-') {
+        return (New-Object Security.Principal.SecurityIdentifier($Identity)).Value
+    }
+
+    return (New-Object Security.Principal.NTAccount($Identity)).Translate(
+        [Security.Principal.SecurityIdentifier]
+    ).Value
 }
 
 function ConvertTo-CommandLine {
@@ -502,9 +583,9 @@ function Register-DailyTask {
         -At $firstRun
 
     $principal = New-ScheduledTaskPrincipal `
-        -UserId 'SYSTEM' `
-        -LogonType ServiceAccount `
-        -RunLevel Highest
+        -UserId $script:HermesUserSid `
+        -LogonType S4U `
+        -RunLevel Limited
 
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
@@ -520,7 +601,7 @@ function Register-DailyTask {
         -Trigger $trigger `
         -Principal $principal `
         -Settings $settings `
-        -Description 'Refreshes the managed Hermes self-update repository, then safely updates Hermes.' `
+        -Description 'Refreshes the managed repository and updates Hermes as its least-privileged profile user.' `
         -Force | Out-Null
 }
 
@@ -532,16 +613,18 @@ function Test-InstalledTask {
     $expectedSupervisor = Join-Path $StatePath $SupervisorFileName
     $expectedPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
-    if ($task.Principal.UserId -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')) {
-        throw "Task principal is not SYSTEM: $($task.Principal.UserId)"
+    $taskPrincipalSid = ConvertTo-SidString $task.Principal.UserId
+
+    if ($taskPrincipalSid -ne $script:HermesUserSid) {
+        throw "Task principal does not match the Hermes profile user: $($task.Principal.UserId)"
     }
 
-    if ($task.Principal.RunLevel.ToString() -ne 'Highest') {
-        throw "Task does not use the Highest run level: $($task.Principal.RunLevel)"
+    if ($task.Principal.RunLevel.ToString() -ne 'Limited') {
+        throw "Task does not use the Limited run level: $($task.Principal.RunLevel)"
     }
 
-    if ($task.Principal.LogonType.ToString() -ne 'ServiceAccount') {
-        throw "Task does not use ServiceAccount logon: $($task.Principal.LogonType)"
+    if ($task.Principal.LogonType.ToString() -ne 'S4U') {
+        throw "Task does not use S4U logon: $($task.Principal.LogonType)"
     }
 
     if ($task.State.ToString() -eq 'Disabled' -or
@@ -603,6 +686,7 @@ $StatePath = Get-NormalizedFullPath $StatePath
 Assert-SafeDirectoryPath -Path $InstallPath -Label 'InstallPath'
 Assert-SafeDirectoryPath -Path $StatePath -Label 'StatePath'
 Assert-SafeDirectoryPath -Path $HermesUserProfile -Label 'HermesUserProfile'
+$script:HermesUserSid = Get-HermesProfileUserSid
 
 if ($InstallPath.StartsWith($StatePath + '\', [StringComparison]::OrdinalIgnoreCase) -or
     $StatePath.StartsWith($InstallPath + '\', [StringComparison]::OrdinalIgnoreCase) -or
@@ -669,7 +753,7 @@ Write-Output "Supervisor: $installedSupervisor"
 Write-Output "Scheduled Task: $TaskName"
 Write-Output "Schedule: daily at $DailyAt local VM time"
 Write-Output "Next run: $(([datetime]$taskInfo.NextRunTime).ToString('yyyy-MM-dd HH:mm:ss')) local VM time"
-Write-Output "Run as: $($task.Principal.UserId) / $($task.Principal.RunLevel)"
+Write-Output "Run as: $($task.Principal.UserId) / S4U / $($task.Principal.RunLevel)"
 
 if ($LegacyBackupPath) {
     Write-Output "Legacy backup: $LegacyBackupPath"

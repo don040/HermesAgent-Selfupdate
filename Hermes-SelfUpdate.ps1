@@ -1873,6 +1873,7 @@ if ($remainingHermesProcesses.Count -gt 0) {
 # Run update
 $updateResult = $null
 $updateExitCode = if ($stopPhaseSucceeded) { 0 } else { 8 }
+$updateOutputText = ''
 
 if ($stopPhaseSucceeded) {
     try {
@@ -1888,6 +1889,29 @@ if ($stopPhaseSucceeded) {
         if ($null -eq $updateExitCode) {
             $updateExitCode = 1
             Write-Log 'Hermes update returned no exit code; treating the update as failed.'
+        }
+
+        $updateOutputText = "$($updateResult.StdOut)`n$($updateResult.StdErr)"
+
+        # Fetch-failure guard (2026-08-23 incident): `hermes update` exits 0
+        # even when the git fetch failed (offline-tolerant "nothing to do"
+        # path). The supervisor then reported SUCCESS while the install
+        # silently stayed behind for two days (dubious-ownership failure).
+        # A failed fetch means neither the runtime nor the desktop build was
+        # updated, so treat the run as failed regardless of the exit code.
+        if ($updateExitCode -eq 0 -and $updateOutputText -match '(?i)failed to fetch updates|dubious ownership|unable to access|could not resolve host|rate limit|having an outage|authentication failed') {
+            Write-Event 'Update fetch failed (hermes update exited 0 as a no-op); treating the run as FAILED.'
+            $updateExitCode = 1
+            Add-ReportSection 'Update fetch failed'
+            Add-ReportLine 'hermes update could not fetch from origin but exited 0. The runtime was NOT updated and the desktop app build was NOT refreshed.'
+        }
+
+        # Desktop rebuild visibility: hermes update prints "Desktop build
+        # failed" on a failed electron-builder pass while still exiting 0.
+        if ($updateExitCode -eq 0 -and $updateOutputText -match 'Desktop build failed') {
+            Write-Event 'Desktop app rebuild failed during the update (hermes update exited 0).'
+            Add-ReportSection 'Desktop app rebuild'
+            Add-ReportLine 'The desktop app rebuild FAILED during the update. Run `hermes desktop` to retry it.'
         }
 
         Set-Content -Path $UpdateOut -Value $updateResult.StdOut -Encoding UTF8
@@ -1947,6 +1971,24 @@ if ($updateExitCode -eq 0) {
             Write-Event "Post-update Hermes health check failed: $($_.Exception.Message)"
         }
     }
+}
+
+# Desktop build stamp for the report (proves the daily run actually rebuilt
+# the desktop app when its source changed — the "App build out of date"
+# warning is computed from this stamp's commit against apps/desktop HEAD).
+$DesktopStampText = 'n/a'
+try {
+    $desktopStampPath = Join-Path $HermesHome 'desktop-build-stamp.json'
+    if (Test-Path -LiteralPath $desktopStampPath) {
+        $desktopStamp = Get-Content -Raw -LiteralPath $desktopStampPath | ConvertFrom-Json
+        $DesktopStampText = "$($desktopStamp.builtAt) (hash $($desktopStamp.contentHash.Substring(0, 8)))"
+    }
+    else {
+        $DesktopStampText = 'not present (desktop app not built)'
+    }
+}
+catch {
+    $DesktopStampText = 'unreadable'
 }
 
 # Restart gateway
@@ -2261,6 +2303,10 @@ Add-ReportLine "Update duration: $(Format-Duration -Duration $RunDuration)"
 Add-ReportLine "Hermes version before: $HermesVersionBefore"
 Add-ReportLine "Hermes version after: $HermesVersionAfter"
 Add-ReportLine "Commits: $commitSummary"
+Add-ReportLine "Desktop build stamp: $DesktopStampText"
+if ($updateOutputText -match 'Desktop build failed') {
+    Add-ReportLine 'Desktop app rebuild: FAILED during update (run "hermes desktop" to retry)'
+}
 Add-ReportLine "Backup size: $backupSize"
 Add-ReportLine "Installation size before: $(Format-ByteSize -Bytes $InstallSizeBeforeBytes)"
 Add-ReportLine "Installation size after: $(Format-ByteSize -Bytes $InstallSizeAfterBytes)"
